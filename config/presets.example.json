@@ -1,0 +1,4 @@
+[
+  { "name": "Example Model (MTP)", "model": "/path/to/model.gguf", "spec": "mtp" },
+  { "model": "/path/to/draft-or-projector.gguf", "exclude": true }
+]

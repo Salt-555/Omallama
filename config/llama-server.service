@@ -1,0 +1,15 @@
+[Unit]
+Description=llama.cpp server (port 6969) - model dispatcher
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/llama-server/serve.sh
+WorkingDirectory=%h/.config/llama-server
+Restart=on-failure
+RestartSec=5
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

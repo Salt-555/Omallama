@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "salt.llama-server",
+  "name": "llama server",
+  "version": "2.0.0",
+  "author": "salt",
+  "description": "Monitor and control the llama.cpp server (port 6969)",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "llama server",
+    "description": "Live llama.cpp server monitor with start/restart/stop and model switching",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollIntervalMs": 2500
+    },
+    "schema": [
+      { "key": "pollIntervalMs", "type": "number", "label": "Poll interval (ms)" }
+    ]
+  }
+}
