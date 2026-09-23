@@ -120,18 +120,21 @@ discovers GGUFs from `~/.lmstudio/models` and writes the active path to
 
 ### Models
 
+The sweet spot on a 96 GiB carve is the **GSQ-RCO IQ3_XXS** quant
+(ISTA-DASLab) — ~47G resident weights + a 28.8G per-layer n-gram PLE table
+that streams from SSD, leaving plenty of room for context:
+
 ```sh
 pip install -U "huggingface_hub[cli]"
-hf download unsloth/Qwen3.8-Flash-Next-GGUF --local-dir ~/.lmstudio/models/unsloth/Qwen3.8-Flash-Next-GGUF
+hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF \
+  --include "IQ3_XXS/*" "mmproj-*" \
+  --local-dir ~/.lmstudio/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
 ```
 
-The MTP draft head ships in the same HF repo: unsloth puts it under
-`MTP/mtp-Qwen3.8-Flash-Next-*.gguf`; other quant publishers use a
-`*-MTP-draft*` file in their model repo. Use the `shared-Q8_0` or `Q8_0`
-variant as `-md` (the draft is tiny; quantizing it below Q8 costs acceptance
-rate for no meaningful memory win). Pick a quant that fits the 96 GiB carve: Q3_K_XL /
-IQ4_XS-class quants (~84-88 GiB) fit with room for context; Q4_K_XL (~111 GiB)
-does not.
+The MTP draft head is a separate, tiny file — unsloth ships it under
+`MTP/mtp-Qwen3.8-Flash-Next-*.gguf` in `unsloth/Qwen3.8-Flash-Next-GGUF`
+(use the `shared-Q8_0` variant as `-md`; quantizing the draft below Q8 costs
+acceptance rate for no meaningful memory win).
 
 ## Install
 
