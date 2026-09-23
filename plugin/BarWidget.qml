@@ -25,6 +25,10 @@ BarWidget {
   property real vramTotal: 0            // bytes
   property string tpsLast: ""           // tok/s of the last completed run
   property bool controlRunning: false
+  // Service state is separate from health: during a model load the unit is
+  // active but /health 503s. Buttons gate on this so a loading server can
+  // still be stopped/restarted from the panel.
+  property bool serviceActive: false
 
   // ---- model selector ------------------------------------------------------
   property var modelOptions: []          // [{value,label,description}]
@@ -39,11 +43,16 @@ BarWidget {
   property string controlAction: ""
   readonly property int switchTimeoutMs: 180000
 
-  readonly property color statusColor: status === "ok"
-    ? (activity === "generating" ? "#ffb300" : "#4caf50")
-    : "#ef5350"
+  // Theme-driven state colors, matching the first-party pattern
+  // (bar.urgent / Color.urgent): urgent for failures, accent while tokens are
+  // moving, muted for ready-but-idle. Follows the active theme's palette.
+  readonly property color urgentColor: bar && bar.urgent ? bar.urgent : Color.urgent
+  readonly property color statusColor: status !== "ok" ? urgentColor
+    : activity === "generating" ? Color.accent
+    : Color.muted
 
-  readonly property string activityLabel: status === "down" ? "offline"
+  readonly property string activityLabel: status === "down"
+    ? (serviceActive ? "loading" : "offline")
     : activity === "generating" ? "generating"
     : "idle"
 
@@ -59,7 +68,7 @@ BarWidget {
 
   // Bar label: last-run speed, activity pulse, offline marker.
   readonly property string barText: {
-    if (status === "down") return "llm ✕"
+    if (status === "down") return serviceActive ? "llm …" : "llm ✕"
     if (tpsLast !== "") return tpsLast + " t/s"
     if (activity === "generating") return "generating…"
     return "llm"
@@ -78,6 +87,9 @@ BarWidget {
   function switchModel(sel) {
     if (modelSetProc.running || controlProc.running) return
     currentModel = sel
+    // Clear the polled preset name so the dropdown reflects the optimistic
+    // selection during the switch instead of the previous model.
+    modelName = ""
     statusNote = ""
     modelSwitching = true
     modelSetProc.command = ["bash", root.pluginDir + "/modelctl.sh", "set", sel]
@@ -179,6 +191,7 @@ BarWidget {
         else if (k === "name") root.modelName = v
         else if (k === "vram") root.vramUsed = parseFloat(v) || 0
         else if (k === "vram_total") root.vramTotal = parseFloat(v) || 0
+        else if (k === "service") root.serviceActive = (v === "active")
       }
     }
   }
@@ -216,11 +229,17 @@ BarWidget {
 
   Process {
     id: modelSetProc
+    // modelctl.sh reports why a switch failed on stderr; capture it so the
+    // panel can show the reason instead of just silently unsticking.
+    stderr: StdioCollector { id: modelSetErr; waitForEnd: true }
     onExited: function(code) {
       if (code === 0) {
         root.serverControl("restart")
       } else {
         root.modelSwitching = false
+        var msg = String((modelSetErr.text || "")).trim()
+        root.statusNote = msg !== "" ? msg : "model switch failed (exit " + code + ")"
+        Qt.callLater(root.loadModels)
       }
     }
   }

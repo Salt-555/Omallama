@@ -55,7 +55,7 @@ Panel {
           Rectangle {
             width: 8; height: 8; radius: 4
             anchors.verticalCenter: parent.verticalCenter
-            color: s.statusColor || "#888888"
+            color: s.statusColor || root.barForeground
           }
           Text {
             text: "llama.cpp · 6969"
@@ -68,7 +68,7 @@ Panel {
           Text {
             text: s.activityLabel || "…"
             anchors.verticalCenter: parent.verticalCenter
-            color: s.statusColor || "#888888"
+            color: s.statusColor || root.barForeground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
           }
@@ -80,7 +80,8 @@ Panel {
           width: parent.width
           spacing: Style.space(6)
           property var rows: [
-            { label: "Status", value: s.status === "down" ? "server offline" : "online" },
+            { label: "Status", value: s.status === "down" ? (s.serviceActive ? "loading model" : "server offline") : "online" },
+            { label: "Service", value: s.serviceActive ? "active" : "inactive" },
             { label: "Activity", value: s.activityLabel || "—" },
             { label: "Model", value: s.modelName || (s.shortModel ? s.shortModel(s.model) : s.model) || "none loaded" },
             { label: "Endpoint", value: "127.0.0.1:6969" },
@@ -113,14 +114,14 @@ Panel {
         Text {
           visible: s.modelSwitching
           text: "Reloading " + (s.currentModel ? String(s.currentModel).split("/").pop() : "…")
-          color: s.statusColor || "#ffb300"
+          color: s.statusColor || root.barForeground
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
         }
         Text {
           visible: s.controlRunning && !s.modelSwitching
           text: "Working…"
-          color: s.statusColor || "#ffb300"
+          color: s.statusColor || root.barForeground
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
         }
@@ -132,12 +133,16 @@ Panel {
           width: parent.width
           wrapMode: Text.WordWrap
           text: s.statusNote || ""
-          color: "#ef5350"
+          color: s.urgentColor || root.barForeground
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
         }
 
         // ---- controls --------------------------------------------------------
+        // Buttons gate on the systemd unit state, not health: while a model is
+        // loading (unit active, /health not yet ok) Stop/Restart must stay
+        // reachable. Start gates on health so a loading server isn't offered
+        // a no-op start.
         Row {
           width: parent.width
           spacing: Style.spacing.controlGap
@@ -147,8 +152,11 @@ Panel {
             leftAlign: true
             width: (parent.width - parent.spacing * 2) / 3
             foreground: root.barForeground
-            accent: "#4caf50"
-            enabled: s.status === "down"
+            // qs.Ui.Button has no disabled visual — dim it explicitly so an
+            // unavailable action reads as unavailable (house pattern:
+            // PanelActionButton dims to Qt.darker when !enabled).
+            opacity: enabled ? 1.0 : 0.35
+            enabled: s.status !== "ok" && !s.serviceActive
             onClicked: s.serverControl("start")
           }
           Button {
@@ -156,8 +164,8 @@ Panel {
             leftAlign: true
             width: (parent.width - parent.spacing * 2) / 3
             foreground: root.barForeground
-            accent: "#ffb300"
-            enabled: s.status === "ok"
+            opacity: enabled ? 1.0 : 0.35
+            enabled: s.serviceActive
             onClicked: s.serverControl("restart")
           }
           Button {
@@ -165,8 +173,8 @@ Panel {
             leftAlign: true
             width: (parent.width - parent.spacing * 2) / 3
             foreground: root.barForeground
-            accent: "#ef5350"
-            enabled: s.status !== "down"
+            opacity: enabled ? 1.0 : 0.35
+            enabled: s.serviceActive
             onClicked: s.serverControl("stop")
           }
         }

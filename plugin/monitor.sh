@@ -28,10 +28,15 @@ ANCHOR="$CFG/.genanchor"    # "<tok> <psec>"
 LASTTPS="$CFG/.last_tps"
 
 # --- server up/down -----------------------------------------------------------
+# Two separate facts: health (can it serve now) and unit state (is it running,
+# including mid model-load when /health 503s). The widget shows "loading" and
+# keeps Stop/Restart available between "unit active" and "health not ok".
 st="down"
 if curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then
   st="ok"
 fi
+unit_state=$(systemctl --user is-active llama-server.service 2>/dev/null || true)
+[[ "$unit_state" == "active" ]] || unit_state="inactive"
 
 tok=0
 psec=0
@@ -52,9 +57,11 @@ if [[ "$st" == "ok" ]]; then
     printf '%s %s\n' "$tok" "$psec" > "$ANCHOR"
   else
     read -r ltok lpsec lgen <<< "$(cat "$STATE" 2>/dev/null || echo '0 0 0')"
-    dt=$((tok - ltok))
+    # Counters are floats and can print in scientific notation once they get
+    # big (e.g. 1.6e+06), so compare with awk, not bash arithmetic ($(( ))
+    # errors on decimals and would silently read as 0 = never generating).
     gen_now=false
-    if (( dt > 0 )); then
+    if awk -v a="$tok" -v b="$ltok" 'BEGIN{exit !(a > b)}'; then
       gen_now=true
       activity="generating"
     fi
@@ -93,6 +100,7 @@ vram=$(cat /sys/class/drm/card1/device/mem_info_vram_used 2>/dev/null)
 vtotal=$(cat /sys/class/drm/card1/device/mem_info_vram_total 2>/dev/null)
 
 printf 'status=%s\n' "$st"
+printf 'service=%s\n' "$unit_state"
 printf 'activity=%s\n' "$activity"
 # Always emitted, empty when there is no run to report, so the widget has a
 # single rule for "no value": absent-from-the-server means clear it.
