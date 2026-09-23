@@ -41,6 +41,17 @@ The plugin scripts and the dispatcher communicate through
 `~/.config/llama-server/` (`model.json` = active model, `presets.json` =
 overrides). `install.sh` will not touch files that already exist there.
 
+## Autostart
+
+The `llama-server.service` unit is **disabled by design**: it is never started
+at boot, and it does not restart itself on failure (`Restart=no`). Loading a
+40-90GB model is something that should happen when you ask for it — a crash
+loop of automatic reloads at login is a real failure mode on unified-memory
+APUs. The widget's Start/Stop buttons (or `systemctl --user start|stop
+llama-server`) are the only things that launch it. If you genuinely want the
+model resident from boot, `systemctl --user enable --now llama-server` is
+available, but the default is off.
+
 ## Configuration
 
 Environment variables (all optional, defaults shown):

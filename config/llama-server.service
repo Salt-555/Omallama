@@ -2,13 +2,20 @@
 Description=llama.cpp server (port 6969) - model dispatcher
 After=graphical-session.target
 Wants=graphical-session.target
+# Deliberately NOT enabled at boot: starting this service loads a 40-90GB
+# model into unified memory. Autostart belongs to a conscious decision, not
+# to a login. `systemctl --user enable llama-server` only if you want the
+# model resident from boot.
 
 [Service]
 Type=simple
 ExecStart=%h/.config/llama-server/serve.sh
 WorkingDirectory=%h/.config/llama-server
-Restart=on-failure
-RestartSec=5
+# Restart=no on purpose: with on-failure, a model that OOMs or a serve.sh
+# that exits nonzero gets retried into a crash loop, each attempt re-loading
+# the whole model. A dead server is a visible "offline" in the widget; press
+# Start when you want it back.
+Restart=no
 IOSchedulingClass=idle
 
 [Install]
