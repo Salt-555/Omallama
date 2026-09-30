@@ -18,8 +18,14 @@
 #
 # Discovery skips projector and draft files (mmproj-*, *-draft, mtp-*) and
 # keeps only the first shard of a split model. This file is the ONLY place the
-# spec rule lives; serve.sh consumes whatever spec value lands in model.json
-# (it accepts legacy DFlash2/MTP spellings too).
+# spec rule AND the backend rule live; serve.sh consumes whatever spec/backend
+# values land in model.json (it accepts legacy DFlash2/MTP spellings too).
+#
+# Backend (backend_for/resolve_backend): gufo-compliant artifacts (gufo-org's
+# curated targets: unsloth Flash-Next UD-Q4_K_XL, unsloth 27B UD-*, antirez
+# deepseek-v4) run on the Gufo runtime via ~/.config/llama-server/serve-gufo.sh;
+# everything else runs a llama.cpp build. A preset may pin {"backend":"gufo"} or
+# {"backend":"llama"} to override the path rule.
 set -u
 
 CFG_DIR="${LLAMA_CFG_DIR:-$HOME/.config/llama-server}"
@@ -57,6 +63,32 @@ resolve_spec() {
     mtp)                      echo mtp;    return ;;
   esac
   spec_for "$sel"
+}
+
+# backend_for <model-path> -> gufo|llama. Gufo runs gufo-org's curated
+# artifacts on their own Strix Halo runtime; every other quant/fork stays on
+# a llama.cpp build. Keep this list in sync with gufo's docs/models table.
+backend_for() {
+  local p="${1,,}"
+  case "$p" in
+    *unsloth/qwen3.8-flash-next-gguf/ud-q4_k_xl/*) echo "gufo" ;;
+    *unsloth/qwen3.8-27b-gguf/ud-*)                echo "gufo" ;;
+    */antirez/deepseek-v4-gguf/*)                  echo "gufo" ;;
+    *)                                             echo "llama" ;;
+  esac
+}
+
+# resolve_backend <name|path> [<resolved-path>] -> gufo|llama. The preset's
+# explicit "backend" wins; else the path rule from backend_for.
+resolve_backend() {
+  local sel="${1:-}" path="${2:-${1:-}}" ov=""
+  ov=$(jq -r --arg n "$sel" --arg p "$path" \
+    '.[] | select(.exclude != true and (.name == $n or .model == $n or .model == $p)) | (.backend // "")' \
+    "$PRESETS" 2>/dev/null | head -1 | tr '[:upper:]' '[:lower:]')
+  case "$ov" in
+    gufo|llama) echo "$ov"; return ;;
+  esac
+  backend_for "$path"
 }
 
 # is_excluded <path> -> 0 when presets.json marks the path exclude:true
@@ -118,12 +150,17 @@ case "${1:-}" in
     # The selection (preset name when given) carries the intent; the path alone
     # cannot tell a dflash preset from an mtp one of the same model.
     spec=$(resolve_spec "$sel")
+    backend=$(resolve_backend "$sel" "$resolved")
     # Record the preset name too so the UI can round-trip the selection even
     # when two presets share one path with different specs.
     name=$(jq -r --arg n "$sel" '.[] | select(.name == $n) | .name' "$PRESETS" 2>/dev/null | head -1)
-    jq -n --arg m "$resolved" --arg s "$spec" --arg n "$name" \
-      '{model: $m, spec: $s} + (if $n != "" then {name: $n} else {} end)' > "$MODEL"
+    jq -n --arg m "$resolved" --arg s "$spec" --arg n "$name" --arg b "$backend" \
+      '{model: $m, spec: $s, backend: $b} + (if $n != "" then {name: $n} else {} end)' > "$MODEL"
     echo "$resolved"
+    ;;
+  resolve-backend)
+    ensure_config
+    resolve_backend "${2:-}" "${3:-${2:-}}"
     ;;
   resolve-spec)
     ensure_config
@@ -147,7 +184,7 @@ case "${1:-}" in
     echo "added: $name -> $path (spec: ${spec:-none})"
     ;;
   *)
-    echo "usage: modelctl.sh {presets|current|set <name|path>|add <path> [name]}" >&2
+    echo "usage: modelctl.sh {presets|current|set <name|path>|add <path> [name]|resolve-backend <name|path> [path]}" >&2
     exit 1
     ;;
 esac

@@ -13,12 +13,19 @@ BarWidget {
 
   // Plugin ships its own scripts; ~/.config/llama-server is runtime state only
   // (model.json, presets.json, serve.sh, and monitor.sh's per-session files
-  // .genstate / .genanchor / .last_tps).
+  // .pollstate / .runanchor / .last_tps).
   readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/salt.llama-server"
 
   // ---- live state ----------------------------------------------------------
   property string status: "down"        // ok | down
-  property string activity: "idle"      // idle | generating
+  // idle | encoding | decoding — monitor.sh classifies the in-flight request
+  // from requests_processing + the n_decode_total rate (llama-server's token
+  // counters only advance at request completion, so phase cannot come from
+  // them). See monitor.sh's header for the measured numbers behind this.
+  property string activity: "idle"
+  property string backend: "llama"          // runtime serving: llama | gufo
+  property string tpsEnc: ""               // last run: encode (prefill) t/s
+  property string ttftMs: ""               // last run: time to first token, ms
   property string model: ""             // active model path
   property string modelName: ""         // active preset name (empty if set by path)
   property real vramUsed: 0             // bytes
@@ -45,16 +52,25 @@ BarWidget {
 
   // Theme-driven state colors, matching the first-party pattern
   // (bar.urgent / Color.urgent): urgent for failures, accent while tokens are
-  // moving, muted for ready-but-idle. Follows the active theme's palette.
+  // being produced, foreground while the server is chewing on input, muted for
+  // ready-but-idle. Follows the active theme's palette.
   readonly property color urgentColor: bar && bar.urgent ? bar.urgent : Color.urgent
   readonly property color statusColor: status !== "ok" ? urgentColor
-    : activity === "generating" ? Color.accent
+    : activity === "decoding" ? Color.accent
+    : activity === "encoding" ? Color.foreground
     : Color.muted
+
+  // status down overlays the phase: unit active but /health not ok yet means
+  // the server is loading, not offline.
+  // Phase glyphs: the bar and panel show just the letter (the phase colors
+  // carry the state); idle keeps its word.
+  readonly property string phaseGlyph: activity === "decoding" ? "D"
+    : activity === "encoding" ? "E"
+    : activity
 
   readonly property string activityLabel: status === "down"
     ? (serviceActive ? "loading" : "offline")
-    : activity === "generating" ? "generating"
-    : "idle"
+    : phaseGlyph
 
   readonly property string vramText: (vramTotal > 0)
     ? (vramUsed / 1073741824).toFixed(0) + "G/" + (vramTotal / 1073741824).toFixed(0) + "G"
@@ -66,11 +82,13 @@ BarWidget {
     return name.replace(/-\d+-of-\d+\.gguf$/, ".gguf").replace(".gguf", "")
   }
 
-  // Bar label: last-run speed, activity pulse, offline marker.
+  // Bar label: live phase glyph while the server is working (token counters
+  // only update at request completion, so no live t/s exists), else the last
+  // completed run's speed, else the offline marker.
   readonly property string barText: {
     if (status === "down") return serviceActive ? "llm …" : "llm ✕"
+    if (activity !== "idle") return phaseGlyph
     if (tpsLast !== "") return tpsLast + " t/s"
-    if (activity === "generating") return "generating…"
     return "llm"
   }
 
@@ -186,7 +204,10 @@ BarWidget {
           }
         }
         else if (k === "activity") root.activity = v
+        else if (k === "backend") root.backend = v
         else if (k === "tps_last") root.tpsLast = v
+        else if (k === "tps_enc") root.tpsEnc = v
+        else if (k === "ttft") root.ttftMs = v
         else if (k === "model") { root.model = v; root.currentModel = v }
         else if (k === "name") root.modelName = v
         else if (k === "vram") root.vramUsed = parseFloat(v) || 0

@@ -8,11 +8,12 @@ one-click model switching with automatic model discovery.
 
 ## What it does
 
-- **Bar widget** (`salt.llama-server`): shows server status (idle / generating
-  / offline) and the tok/s of the last completed generation. Click opens a
-  control panel; right-click forces a poll refresh.
-- **Panel**: status rows (state, activity, model, endpoint, VRAM), start /
-  restart / stop buttons, and a searchable model dropdown.
+- **Bar widget** (`salt.llama-server`): shows server status (idle / encoding
+  `E` / decoding `D` / offline), the runtime in use (llama.cpp or Gufo), and
+  the decode tok/s of the last completed run. Click opens a control panel;
+  right-click forces a poll refresh.
+- **Panel**: last-run rates (encode + decode tok/s), time to first token,
+  VRAM, start / restart / stop buttons, and a searchable model dropdown.
 - **Model discovery**: the dropdown is discovered live from disk
   (`~/.lmstudio/models` by default) every time it opens — new GGUFs appear
   automatically; projector files, draft models, and later shards are skipped.
@@ -32,7 +33,9 @@ install.sh installer (never overwrites your existing config)
 
 The dispatcher routes each model to a build that actually supports its
 architecture. On Strix Halo (Radeon 8060S, gfx1151) all of these build with
-**Vulkan**, not CUDA — ROCm/HIP is unreliable on this chip. You need
+**Vulkan**, not CUDA — llama.cpp's ROCm/HIP path is unreliable on this chip.
+(That is a llama.cpp verdict, not a silicon one: Gufo's dedicated gfx1151 HIP
+kernels below run great.) You need
 `vulkan-radeon`, `vulkan-headers`, `glslc`, `spirv-headers`, and a 96 GiB GPU
 UMA carve-out (`cat /sys/class/drm/card*/device/mem_info_vram_total` should
 report ~96G; on most boards this is set in BIOS as "UMA frame buffer" /
@@ -103,7 +106,42 @@ git -C llamacpp-rocmfpx/llama.cpp switch vulkan/qwen4exp-rocmfpx
 This fork tolerates q8_0 KV cache with qwen4exp (`-ctk q8_0 -ctv q8_0`), which
 the mainline PR does not.
 
-### Wiring it up
+### 4. Gufo (compliance-first runtime, automatic)
+
+[Gufo](https://github.com/gufo-org/gufo) is a Strix-Halo-only inference engine
+with hand-written HIP kernels for gfx1151 (Wave32, no Triton/CK/MIOpen). On
+Flash-Next it measures ~1629 tok/s prefill, 3.4x llama.cpp's throughput at 8
+concurrent users, and a ~15s model load. It ships as the official
+`gufo-runtime` container — no toolchain to build.
+
+Gufo only serves its own curated, audited artifacts (the file lists on its
+model pages map 1:1 to HF repos). The dispatcher routes a model to Gufo
+automatically when it is on that compliance list — the rule lives in
+`modelctl.sh` (`resolve-backend`) and a preset's explicit `"backend"` field
+overrides it. Serving anything else on Gufo is undefined behavior, which is
+exactly why both backends stay in the dispatcher.
+
+```sh
+# one-time: the official runtime container
+docker pull ghcr.io/gufo-org/toolboxes/gufo-runtime:latest
+
+# the gufo-compliant Flash-Next quant (unsloth UD-Q4_K_XL + MTP sidecar)
+hf download unsloth/Qwen3.8-Flash-Next-GGUF \
+  --include "UD-Q4_K_XL/*" "MTP/*" "mmproj-BF16*" \
+  --local-dir ~/.lmstudio/models/unsloth/Qwen3.8-Flash-Next-GGUF
+```
+
+`config/serve-gufo.sh` runs it on the standard bridge (port 6969, served name
+ALLMIND like every other widget model) with `--device /dev/kfd --device /dev/dri
+--ulimit memlock=-1`. Nothing is needed when just running a model; these only
+matter at load time and all avoid kernel parameters and reboots: memlock
+(`ulimit -l` must not cap the container), and optionally a larger GTT window
+for giant prefill batches. Measured on the 96/32 split: 91.2 GiB of the 96 GiB
+carve, host side untouched.
+
+The widget's phase labels come from gufo's `--log-progress` events (prefill
+chunk / decode boundary), and encode/decode rates and TTFT come straight from
+its per-request timing logs.
 
 Point the dispatcher at the builds (defaults shown):
 
@@ -173,6 +211,9 @@ Environment variables (all optional, defaults shown):
 | `LLAMA_QWEN_NEXT_DIR` | `~/CodingProjects/llamacpp-qwen-next` | config/serve.sh |
 | `LLAMA_ROCMFPX_SERVE` | `~/CodingProjects/llamacpp-rocmfpx/serve.sh` | config/serve.sh |
 | `LLAMA_DEFAULT_MODEL` | unsloth Qwen3.8-27B Q4 path | config/serve.sh |
+| `GUFO_SESSIONS` | `4` | config/serve-gufo.sh |
+| `GUFO_CONTEXT` | `65536` | config/serve-gufo.sh |
+| `GUFO_CACHE_DIR` | `~/.cache/gufo` | config/serve-gufo.sh (runtime + artifact digest cache) |
 
 Edit `config/serve.sh` to add or change routes — it pattern-matches the active
 model path and execs the right build. Each target build's serve script owns its
@@ -186,13 +227,16 @@ stripped). Use `presets.json` to override a name or spec, or to hide a file:
 ```json
 [
   { "name": "My 27B (MTP)", "model": "/path/to/model.gguf", "spec": "mtp" },
+  { "name": "My Gufo model", "model": "/path/to/ud-q4.gguf", "spec": "mtp", "backend": "gufo" },
   { "model": "/path/to/draft.gguf", "exclude": true }
 ]
 ```
 
 `spec` (`dflash` / `mtp`) is written into `model.json` on selection; the spec
 rule lives in one place (`modelctl.sh`'s `spec_for`), which also guesses from
-the filename for unknown models.
+the filename for unknown models. `backend` (`gufo` / `llama`) forces the
+serving runtime for that preset and wins over the automatic path rule; run
+`modelctl.sh resolve-backend <path>` to see what would be chosen.
 
 ## CLI
 
@@ -202,6 +246,7 @@ the filename for unknown models.
 modelctl.sh presets            # name<TAB>path<TAB>spec, discovered from disk
 modelctl.sh current            # active model path
 modelctl.sh set <name|path>    # switch (widget then restarts the service)
+modelctl.sh resolve-backend <name|path>  # gufo|llama: which runtime serves it
 modelctl.sh add <path> [name]  # record a name/spec override
 ```
 
@@ -209,7 +254,8 @@ modelctl.sh add <path> [name]  # record a name/spec override
 
 1. Widget writes the selection to `model.json` via `modelctl.sh set`.
 2. Widget runs `systemctl --user restart llama-server.service`.
-3. `serve.sh` reads `model.json` and execs the right llama.cpp build.
+3. `serve.sh` reads `model.json` and execs the right backend: a gufo
+   container (`serve-gufo.sh`) or the matching llama.cpp build.
 4. Widget polls `/health` + `/metrics` until the new model reports ok (with a
    watchdog so a failed load surfaces as an error, not an eternal spinner).
 

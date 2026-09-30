@@ -3,8 +3,8 @@
 #
 # Copies the plugin into ~/.config/omarchy/plugins/salt.llama-server and the
 # control-plane config into ~/.config/llama-server, then rescans the shell.
-# Existing config (presets.json, model.json, serve.sh) is NEVER overwritten —
-# re-running is safe and only refreshes plugin code.
+# Existing config (presets.json, model.json, serve.sh, serve-gufo.sh) is NEVER
+# overwritten — re-running is safe and only refreshes plugin code.
 #
 # Per Omarchy semantics this script deliberately does NOT call
 # `omarchy plugin enable`: enable goes over IPC to the running shell and
@@ -30,6 +30,12 @@ if [[ ! -f "$CFG_DST/serve.sh" ]]; then
   chmod +x "$CFG_DST/serve.sh"
 else
   echo "    serve.sh exists, left untouched"
+fi
+if [[ ! -f "$CFG_DST/serve-gufo.sh" ]]; then
+  cp -v "$SRC/config/serve-gufo.sh" "$CFG_DST/"
+  chmod +x "$CFG_DST/serve-gufo.sh"
+else
+  echo "    serve-gufo.sh exists, left untouched"
 fi
 if [[ ! -f "$CFG_DST/presets.json" ]]; then
   cp -v "$SRC/config/presets.example.json" "$CFG_DST/presets.json"

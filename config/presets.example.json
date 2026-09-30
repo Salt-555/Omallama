@@ -1,4 +1,5 @@
 [
   { "name": "Example Model (MTP)", "model": "/path/to/model.gguf", "spec": "mtp" },
+  { "name": "Example Gufo Model (MTP)", "model": "/path/to/gufo-quant.gguf", "spec": "mtp", "backend": "gufo" },
   { "model": "/path/to/draft-or-projector.gguf", "exclude": true }
 ]

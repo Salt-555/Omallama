@@ -58,7 +58,7 @@ Panel {
             color: s.statusColor || root.barForeground
           }
           Text {
-            text: "llama.cpp · 6969"
+            text: (s.backend === "gufo" ? "Gufo" : "llama.cpp") + " · 6969"
             color: root.barForeground
             font.family: Style.font.family
             font.pixelSize: Style.font.subtitle
@@ -80,11 +80,12 @@ Panel {
           width: parent.width
           spacing: Style.space(6)
           property var rows: [
-            { label: "Status", value: s.status === "down" ? (s.serviceActive ? "loading model" : "server offline") : "online" },
-            { label: "Service", value: s.serviceActive ? "active" : "inactive" },
-            { label: "Activity", value: s.activityLabel || "—" },
-            { label: "Model", value: s.modelName || (s.shortModel ? s.shortModel(s.model) : s.model) || "none loaded" },
-            { label: "Endpoint", value: "127.0.0.1:6969" },
+            {
+              label: "Tokens/s",
+              value: (s.tpsEnc ? "enc " + s.tpsEnc : "enc —")
+                     + " · " + (s.tpsLast ? "dec " + s.tpsLast : "dec —")
+            },
+            { label: "TTFT", value: s.ttftMs ? s.ttftMs + " ms" : "—" },
             { label: "VRAM", value: s.vramText || "—" }
           ]
           Repeater {
