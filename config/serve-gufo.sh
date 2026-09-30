@@ -49,15 +49,20 @@ CT_MODEL="/models/$rel"
 
 # Base sessions x context per model; GUFO_SESSIONS / GUFO_CONTEXT override.
 # Gufo reserves per-session capacity at admission (see SERVER.md), so the
-# product is the real memory knob. Flash-Next runs one full-window main
-# thread (1 x 250000; native max is 262144). Other gufo models keep the
-# generic 4 x 65536 shape until they get their own numbers.
+# product is the real memory knob. Flash-Next runs two 130k threads
+# (2 x 130000; native max is 262144). Other gufo models keep the generic
+# 4 x 65536 shape until they get their own numbers.
 case "$lower" in
-  *flash-next*) DEF_SESSIONS=1; DEF_CONTEXT=250000 ;;
+  *flash-next*) DEF_SESSIONS=2; DEF_CONTEXT=130000 ;;
   *)            DEF_SESSIONS=4; DEF_CONTEXT=65536 ;;
 esac
 SESSIONS="${GUFO_SESSIONS:-$DEF_SESSIONS}"
 CONTEXT="${GUFO_CONTEXT:-$DEF_CONTEXT}"
+# Publish the effective runtime config for monitor.sh's queue accounting
+# (gufo exports no requests_deferred metric; the widget derives the split
+# from this pool size + journal inflight count).
+printf 'sessions=%s\ncontext=%s\n' "$SESSIONS" "$CONTEXT" \
+  > "$HOME/.config/llama-server/.gufo_runtime"
 
 # --- speculative sidecars (per gufo docs/models/<model>/README.md) -----------
 CT_ARGS=()

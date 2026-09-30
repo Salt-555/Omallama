@@ -26,6 +26,8 @@ BarWidget {
   property string backend: "llama"          // runtime serving: llama | gufo
   property string tpsEnc: ""               // last run: encode (prefill) t/s
   property string ttftMs: ""               // last run: time to first token, ms
+  property string reqActive: "0"           // requests on a session right now
+  property string reqDeferred: "0"         // requests waiting in the queue
   property string model: ""             // active model path
   property string modelName: ""         // active preset name (empty if set by path)
   property real vramUsed: 0             // bytes
@@ -208,6 +210,8 @@ BarWidget {
         else if (k === "tps_last") root.tpsLast = v
         else if (k === "tps_enc") root.tpsEnc = v
         else if (k === "ttft") root.ttftMs = v
+        else if (k === "req_active") root.reqActive = v
+        else if (k === "req_deferred") root.reqDeferred = v
         else if (k === "model") { root.model = v; root.currentModel = v }
         else if (k === "name") root.modelName = v
         else if (k === "vram") root.vramUsed = parseFloat(v) || 0

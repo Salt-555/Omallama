@@ -86,6 +86,8 @@ Panel {
                      + " · " + (s.tpsLast ? "dec " + s.tpsLast : "dec —")
             },
             { label: "TTFT", value: s.ttftMs ? s.ttftMs + " ms" : "—" },
+            { label: "Req active", value: s.reqActive },
+            { label: "Req deferred", value: s.reqDeferred },
             { label: "VRAM", value: s.vramText || "—" }
           ]
           Repeater {

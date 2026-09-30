@@ -120,6 +120,18 @@ if [[ "$GUFO" == 1 ]]; then
   [[ "$proc" -lt 0 ]] && proc=0
   busy=0
   if [[ "$proc" -gt 0 ]]; then busy=1; fi
+  # Queue accounting: gufo exports no requests_deferred, but its admission
+  # model is exact for this split — at most <sessions> requests run (bounded
+  # executor pool, SERVER.md), the rest wait in kQueued. Split the
+  # journal-derived inflight count accordingly. llama.cpp reports both
+  # natively through the metrics path above.
+  sess=$(awk -F= '/^sessions=/{print $2; exit}' "$CFG/.gufo_runtime" 2>/dev/null || true)
+  sess=${sess:-1}
+  defer=0
+  if [[ "$proc" -gt "$sess" ]]; then
+    defer=$((proc - sess))
+    proc=$sess
+  fi
   # Live phase from gufo's --log-progress events: the latest phase= field names
   # prefill or decode per in-flight request. No progress line yet means the
   # request just landed — prefill always comes first, so "encoding" is the
