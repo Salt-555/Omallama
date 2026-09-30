@@ -27,10 +27,7 @@ PORT=6969
 SERVED_NAME="ALLMIND"
 # Flag spelling verified against `gufo serve llm --help` (docs defer to --help).
 SERVED_FLAG="--served-model-name"
-# Sessions x context mirrors the llama.cpp backends' 262144/4-slot split
-# (gufo reserves per-session capacity at admission; see SERVER.md).
-SESSIONS="${GUFO_SESSIONS:-4}"
-CONTEXT="${GUFO_CONTEXT:-65536}"
+# Sessions x context are set per model below (after target resolution).
 CACHE_DIR="${GUFO_CACHE_DIR:-$HOME/.cache/gufo}"
 
 # --- active model (same resolution order as the llama.cpp backends) -----------
@@ -49,6 +46,18 @@ SPEC_MODE=$(jq -r '.spec // empty' "$MODEL_CONF" 2>/dev/null | tr '[:upper:]' '[
 lower="${TARGET,,}"
 rel="${TARGET#"$MODELS_ROOT"/}"
 CT_MODEL="/models/$rel"
+
+# Base sessions x context per model; GUFO_SESSIONS / GUFO_CONTEXT override.
+# Gufo reserves per-session capacity at admission (see SERVER.md), so the
+# product is the real memory knob. Flash-Next runs one full-window main
+# thread (1 x 250000; native max is 262144). Other gufo models keep the
+# generic 4 x 65536 shape until they get their own numbers.
+case "$lower" in
+  *flash-next*) DEF_SESSIONS=1; DEF_CONTEXT=250000 ;;
+  *)            DEF_SESSIONS=4; DEF_CONTEXT=65536 ;;
+esac
+SESSIONS="${GUFO_SESSIONS:-$DEF_SESSIONS}"
+CONTEXT="${GUFO_CONTEXT:-$DEF_CONTEXT}"
 
 # --- speculative sidecars (per gufo docs/models/<model>/README.md) -----------
 CT_ARGS=()
