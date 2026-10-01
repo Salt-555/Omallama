@@ -64,15 +64,18 @@ BarWidget {
 
   // status down overlays the phase: unit active but /health not ok yet means
   // the server is loading, not offline.
-  // Phase glyphs: the bar and panel show just the letter (the phase colors
-  // carry the state); idle keeps its word.
-  readonly property string phaseGlyph: activity === "decoding" ? "D"
-    : activity === "encoding" ? "E"
+  // Phase glyphs: the bar shows ENC/DEC (the phase colors carry the state);
+  // idle keeps its word. phaseWord is the panel's spelled-out variant.
+  readonly property string phaseGlyph: activity === "decoding" ? "DEC"
+    : activity === "encoding" ? "ENC"
+    : activity
+  readonly property string phaseWord: activity === "decoding" ? "decoding"
+    : activity === "encoding" ? "encoding"
     : activity
 
   readonly property string activityLabel: status === "down"
     ? (serviceActive ? "loading" : "offline")
-    : phaseGlyph
+    : phaseWord
 
   readonly property string vramText: (vramTotal > 0)
     ? (vramUsed / 1073741824).toFixed(0) + "G/" + (vramTotal / 1073741824).toFixed(0) + "G"

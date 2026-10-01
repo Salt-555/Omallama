@@ -66,7 +66,10 @@ Panel {
           }
           Item { width: 1; height: 1 }
           Text {
-            text: s.activityLabel || "…"
+            // Literal phaseWord: activityLabel doesn't exist on the Panel base,
+            // so reading it before injectPanel wires hostWidget logged
+            // "Unable to assign [undefined] to QString" on every load.
+            text: s.phaseWord || s.activityLabel || "…"
             anchors.verticalCenter: parent.verticalCenter
             color: s.statusColor || root.barForeground
             font.family: Style.font.family
@@ -79,15 +82,19 @@ Panel {
           id: statusColumn
           width: parent.width
           spacing: Style.space(6)
+          // Every value reads host props through `s`; guard them all — the
+          // host props don't exist on the Panel base until injectPanel wires
+          // hostWidget, and undefined rows tripped
+          // "Unable to assign [undefined] to QString" on every panel load.
           property var rows: [
             {
               label: "Tokens/s",
-              value: (s.tpsEnc ? "enc " + s.tpsEnc : "enc —")
-                     + " · " + (s.tpsLast ? "dec " + s.tpsLast : "dec —")
+              value: ((s.tpsEnc || "") ? "enc " + s.tpsEnc : "enc —")
+                     + " · " + ((s.tpsLast || "") ? "dec " + s.tpsLast : "dec —")
             },
-            { label: "TTFT", value: s.ttftMs ? s.ttftMs + " ms" : "—" },
-            { label: "Req active", value: s.reqActive },
-            { label: "Req deferred", value: s.reqDeferred },
+            { label: "TTFT", value: (s.ttftMs || "") ? s.ttftMs + " ms" : "—" },
+            { label: "Req active", value: s.reqActive || "0" },
+            { label: "Req deferred", value: s.reqDeferred || "0" },
             { label: "VRAM", value: s.vramText || "—" }
           ]
           Repeater {

@@ -15,15 +15,15 @@ set -euo pipefail
 export RADV_DEBUG="${RADV_DEBUG:+$RADV_DEBUG,}hang"
 
 MODEL_CONF="$HOME/.config/llama-server/model.json"
-DEFAULT_STRIX="${LLAMA_STRIX_SERVE:-/home/salt/CodingProjects/llamacpp-strix-halo/serve.sh}"
-QWEN_NEXT_DIR="${LLAMA_QWEN_NEXT_DIR:-/home/salt/CodingProjects/llamacpp-qwen-next}"
+DEFAULT_STRIX="${LLAMA_STRIX_SERVE:-$HOME/CodingProjects/llamacpp-strix-halo/serve.sh}"
+QWEN_NEXT_DIR="${LLAMA_QWEN_NEXT_DIR:-$HOME/CodingProjects/llamacpp-qwen-next}"
 
 # Resolve the active model (default to the strix-halo Q4).
 TARGET=""
 if [[ -f "$MODEL_CONF" ]]; then
   TARGET=$(jq -r '.model // empty' "$MODEL_CONF" 2>/dev/null || true)
 fi
-[[ -n "$TARGET" && -f "$TARGET" ]] || TARGET="${LLAMA_DEFAULT_MODEL:-/home/salt/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf}"
+[[ -n "$TARGET" && -f "$TARGET" ]] || TARGET="${LLAMA_DEFAULT_MODEL:-$HOME/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf}"
 
 # Gufo-compliant artifacts run on gufo-org's own Strix Halo runtime instead of
 # a llama.cpp build. The backend rule lives in modelctl.sh (resolve-backend);
@@ -43,7 +43,7 @@ fi
 #   - ROCmFP4 quants -> LaurentZuijdwijk fork (vulkan/qwen4exp-rocmfpx)
 #   - mainline quants (Q3_K_XL etc.) -> mainline + PR27742 build
 if [[ "${TARGET,,}" == *"rocmfp4"* ]]; then
-  exec "${LLAMA_ROCMFPX_SERVE:-/home/salt/CodingProjects/llamacpp-rocmfpx/serve.sh}"
+  exec "${LLAMA_ROCMFPX_SERVE:-$HOME/CodingProjects/llamacpp-rocmfpx/serve.sh}"
 fi
 # GSQ-RCO quants of Flash-Next (qwen4exp arch) need the qwen-next build; the
 # 27B GSQ-RCO (qwen35 arch) runs on the strix-halo build below.
