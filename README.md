@@ -194,7 +194,10 @@ at boot, and it does not restart itself on failure (`Restart=no`). Loading a
 40-90GB model is something that should happen when you ask for it — a crash
 loop of automatic reloads at login is a real failure mode on unified-memory
 APUs. The widget's Start/Stop buttons (or `systemctl --user start|stop
-llama-server`) are the only things that launch it. If you genuinely want the
+llama-server`) are the only things that launch it. The Gufo container rides
+the same unit (`docker run --rm`, attached): starting the service loads it,
+stopping the service stops and removes it, and model switches are restarts.
+Nothing of it stays resident between sessions. If you genuinely want the
 model resident from boot, `systemctl --user enable --now llama-server` is
 available, but the default is off.
 
@@ -264,6 +267,7 @@ modelctl.sh add <path> [name]  # record a name/spec override
 - Omarchy (Quattro shell / Quickshell) for the widget
 - llama.cpp server builds reachable at the paths in `config/serve.sh`
 - `jq`, `curl`, `systemd` user session
+- Docker (user in the `docker` group) for the Gufo backend only
 - AMD Strix Halo assumed for VRAM readout (`mem_info_vram_*`); falls back to "—"
 
 ## License
