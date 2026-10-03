@@ -92,21 +92,7 @@ alongside the model from the same quant publisher). Flash-Next specifics:
   command-buffer dispatches inside the AMDGPU watchdog limit).
 - `-ngl 999 -fa on --jinja -np 1`; mmap on (96G carve + 32G host pool).
 
-### 3. ROCmFP4-quantized Flash-Next
-
-For the ROCmFP4 quant format (charlie12345/ROCmFPx), use
-[LaurentZuijdwijk's fork](https://github.com/LaurentZuijdwijk/llama.cpp):
-
-```sh
-git clone https://github.com/LaurentZuijdwijk/llama.cpp llamacpp-rocmfpx/llama.cpp
-git -C llamacpp-rocmfpx/llama.cpp switch vulkan/qwen4exp-rocmfpx
-# ...common build invocation into build/...
-```
-
-This fork tolerates q8_0 KV cache with qwen4exp (`-ctk q8_0 -ctv q8_0`), which
-the mainline PR does not.
-
-### 4. Gufo (compliance-first runtime, automatic)
+### 3. Gufo (compliance-first runtime, automatic)
 
 [Gufo](https://github.com/gufo-org/gufo) is a Strix-Halo-only inference engine
 with hand-written HIP kernels for gfx1151 (Wave32, no Triton/CK/MIOpen). On
@@ -148,7 +134,6 @@ Point the dispatcher at the builds (defaults shown):
 ```bash
 export LLAMA_STRIX_SERVE=~/llamacpp-strix-halo/serve.sh
 export LLAMA_QWEN_NEXT_DIR=~/llamacpp-qwen-next
-export LLAMA_ROCMFPX_SERVE=~/llamacpp-rocmfpx/serve.sh
 ```
 
 Each directory's `serve.sh` hardcodes its own model paths and flags — edit
@@ -212,7 +197,6 @@ Environment variables (all optional, defaults shown):
 | `LLAMA_BASE_URL` | `http://127.0.0.1:6969` | monitor.sh |
 | `LLAMA_STRIX_SERVE` | `~/CodingProjects/llamacpp-strix-halo/serve.sh` | config/serve.sh |
 | `LLAMA_QWEN_NEXT_DIR` | `~/CodingProjects/llamacpp-qwen-next` | config/serve.sh |
-| `LLAMA_ROCMFPX_SERVE` | `~/CodingProjects/llamacpp-rocmfpx/serve.sh` | config/serve.sh |
 | `LLAMA_DEFAULT_MODEL` | unsloth Qwen3.8-27B Q4 path | config/serve.sh |
 | `GUFO_SESSIONS` | `4` | config/serve-gufo.sh |
 | `GUFO_CONTEXT` | `65536` | config/serve-gufo.sh |

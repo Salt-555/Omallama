@@ -39,12 +39,8 @@ if [[ "${BACKEND,,}" == "gufo" ]]; then
   exec "$HOME/.config/llama-server/serve-gufo.sh"
 fi
 
-# Flash-Next (qwen4exp arch) needs a qwen4exp-capable build. Two variants:
-#   - ROCmFP4 quants -> LaurentZuijdwijk fork (vulkan/qwen4exp-rocmfpx)
-#   - mainline quants (Q3_K_XL etc.) -> mainline + PR27742 build
-if [[ "${TARGET,,}" == *"rocmfp4"* ]]; then
-  exec "${LLAMA_ROCMFPX_SERVE:-$HOME/CodingProjects/llamacpp-rocmfpx/serve.sh}"
-fi
+# Flash-Next (qwen4exp arch) needs a qwen4exp-capable build: mainline quants
+# (Q3_K_XL etc.) run on the mainline + PR27742 build.
 # GSQ-RCO quants of Flash-Next (qwen4exp arch) need the qwen-next build; the
 # 27B GSQ-RCO (qwen35 arch) runs on the strix-halo build below.
 if [[ "${TARGET,,}" == *"gsq-rco"* && "${TARGET,,}" == *"flash-next"* ]]; then

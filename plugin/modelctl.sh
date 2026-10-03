@@ -46,7 +46,6 @@ spec_for() {
   case "$p" in
     *dflash2*)     echo "dflash" ;;
     *qwen3.8-27b*) echo "dflash" ;;
-    *rocmfp4*)     echo "mtp" ;;
     *gsq-rco*)     echo "mtp" ;;
     *)             echo "" ;;
   esac
