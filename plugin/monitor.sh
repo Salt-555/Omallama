@@ -32,6 +32,13 @@
 # run number, measured from the completion-batched predicted counters over the
 # run window that begins at the last known-idle anchor.
 #
+# tok/W is a per-TURN number, and the turn is the whole request: encode + decode.
+# It is generated tokens / joules, where joules is the integral of sampled power
+# across the busy window -- so the prefill (encoding) cost is charged against the
+# tokens it helped produce instead of being ignored. Power is read from the
+# NVIDIA card when present, else the iGPU hwmon node. The per-turn average watts
+# (AVGW) is the same integral over the server-reported prefill+decode seconds.
+#
 # --- state (all scoped to ONE server session) ---------------------------------
 # The counters reset with the process, so any snapshot older than the current
 # process is meaningless arithmetic. A poll with no state seeds from the live
@@ -54,6 +61,31 @@ ANCHOR="$CFG/.runanchor"
 LASTTPS="$CFG/.last_tps"
 LASTENC="$CFG/.last_tps_enc"
 LASTTTFT="$CFG/.last_ttft"
+TOKW="$CFG/.last_tokw"     # tokens/joule over the last completed turn
+AVGW="$CFG/.last_avgw"     # average watts over the last completed turn
+ENERGY="$CFG/.energy"      # "<joules> <last_ts> <last_busy>" power integrator
+TANCHOR="$CFG/.turnanchor" # counters at the last idle: "<pred> <psec> <prom> <promsec>"
+
+# --- GPU power (watts) --------------------------------------------------------
+# Prefer a discrete NVIDIA card when present (nvidia-smi), else the Strix Halo
+# iGPU via its hwmon node. Prints watts, or nothing when unknown.
+read_power() {
+  local p="" f
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    p=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    # power.draw comes back as [N/A] when the card is idle, in MIG, or blocked
+    # by permissions; accept only a real number, else fall back to the iGPU.
+    [[ "$p" =~ ^[0-9]+([.][0-9]+)?$ ]] || p=""
+  fi
+  if [[ -z "$p" ]]; then
+    for f in /sys/class/drm/card*/device/hwmon/hwmon*/power1_average; do
+      [[ -r "$f" ]] || continue
+      p=$(awk '{printf "%.1f", $1/1000000}' "$f" 2>/dev/null)
+      [[ -n "$p" ]] && break
+    done
+  fi
+  printf '%s' "${p:-}"
+}
 
 mkdir -p "$CFG" 2>/dev/null || true
 exec 9>"$CFG/.monitor.lock" && flock -w 5 9 || true
@@ -73,6 +105,10 @@ if curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then
 fi
 unit_state=$(systemctl --user is-active llama-server.service 2>/dev/null || true)
 [[ "$unit_state" == "active" ]] || unit_state="inactive"
+
+# Instantaneous GPU power for this poll (also the raw sample fed to the peak
+# tracker below).
+pwr="$(read_power)"
 
 pred=0; psec=0; ndec=0; proc=0; defer=0; prom=0; promsec=0
 if [[ "$st" == "ok" ]]; then
@@ -112,7 +148,12 @@ if [[ "$GUFO" == 1 ]]; then
   invid=$(systemctl --user show -p InvocationID --value llama-server.service 2>/dev/null || true)
   jl=""
   if [[ -n "$invid" ]]; then
-    jl=$(journalctl --user -u llama-server.service "_SYSTEMD_INVOCATION_ID=$invid" -n 400 --no-pager -o cat 2>/dev/null || true)
+    # Full invocation journal, not a tail window: --log-progress floods the
+    # journal (hundreds of lines per request), and a capped tail scrolls out a
+    # request's received event while keeping its completed pair — inflight goes
+    # negative, clamps to zero, and the phase display dies. Filtered at capture
+    # to the two tags this profile actually reads.
+    jl=$(journalctl --user -u llama-server.service "_SYSTEMD_INVOCATION_ID=$invid" --no-pager -o cat 2>/dev/null | grep -E '\[http\]|\[progress\]' || true)
   fi
   nrecv=$(grep -c 'event=received .*path=/v1/chat/completions' <<<"$jl" || true)
   ncomp=$(grep -c 'event=completed .*path=/v1/chat/completions' <<<"$jl" || true)
@@ -138,7 +179,14 @@ if [[ "$GUFO" == 1 ]]; then
   # honest default until the first chunk logs.
   activity="idle"
   if [[ "$busy" == 1 ]]; then
-    ph=$(grep -o 'phase=[a-z]*' <<<"$jl" | tail -1 | cut -d= -f2 || true)
+    # Phase lines after the latest received event describe the in-flight
+    # request; earlier ones are a finished run's leftovers and would mislabel
+    # the gap before the first prefill chunk logs.
+    start=$(grep -n 'event=received .*path=/v1/chat/completions' <<<"$jl" | tail -1 | cut -d: -f1)
+    ph=""
+    if [[ -n "$start" ]]; then
+      ph=$(tail -n "+$start" <<<"$jl" | grep -o 'phase=[a-z]*' | tail -1 | cut -d= -f2 || true)
+    fi
     case "$ph" in
       decode) activity="decoding" ;;
       *)      activity="encoding" ;;
@@ -161,7 +209,7 @@ elif [[ "$st" != "ok" ]]; then
   # the state so a restart cannot compare across process boundaries or display
   # a dead session's speed. (.last_tps is still emitted, empty, so the widget
   # clears its readout instead of keeping the stale number.)
-  rm -f "$STATE" "$ANCHOR" "$LASTTPS" "$LASTENC" "$LASTTTFT" "$CFG/.genstate" "$CFG/.genanchor"
+  rm -f "$STATE" "$ANCHOR" "$LASTTPS" "$LASTENC" "$LASTTTFT" "$TOKW" "$AVGW" "$CFG/.genstate" "$CFG/.genanchor"
 else
   if [[ ! -f "$STATE" ]]; then
     # First poll of a server session: the counters belong to the process that
@@ -232,6 +280,47 @@ else
   fi
 fi
 
+# --- turn efficiency: tokens/joule over the whole turn (encode + decode) -----
+# A turn runs idle -> idle: one request, or a back-to-back burst with no idle
+# gap. Energy is the integral of sampled power across the busy window, so the
+# prefill (encoding) cost is inside the denominator, not ignored; averaging the
+# integral, not a peak sample, is what makes it a turn figure.
+read -r e_j e_ts e_busy < <(cat "$ENERGY" 2>/dev/null || echo "0 0 0")
+e_j=${e_j:-0}; e_ts=${e_ts:-0}; e_busy=${e_busy:-0}
+if [[ "$st" == "ok" ]] && [[ "$e_ts" -gt 0 ]] && [[ -n "${pwr:-}" ]]; then
+  # Only integrate across a sane gap; a sleep/hiccup must not inject energy.
+  dte=$(awk -v a="$now" -v b="$e_ts" 'BEGIN{ printf "%.2f", a-b }')
+  if awk -v d="$dte" 'BEGIN{ exit !(d>=0.25 && d<=10) }'; then
+    if [[ "$busy" == 1 || "$e_busy" == 1 ]]; then
+      e_j=$(awk -v a="$e_j" -v w="$pwr" -v s="$dte" 'BEGIN{ printf "%.4f", a+w*s }')
+    fi
+  fi
+fi
+
+if [[ "$st" == "ok" ]]; then
+  # Anchor = counters at the last idle. Both backends advance
+  # tokens_predicted_total at request completion, so one rule covers llama + gufo.
+  read -r t_pred t_psec t_prom t_promsec < <(cat "$TANCHOR" 2>/dev/null || echo "$pred $psec $prom $promsec")
+  t_pred=${t_pred:-$pred}; t_psec=${t_psec:-0}; t_promsec=${t_promsec:-0}
+  if fcmp "$pred" "$t_pred" ">"; then
+    outtok=$(awk -v a="$pred" -v b="$t_pred" 'BEGIN{ printf "%.0f", a-b }')
+    tsecs=$(awk -v a="$psec" -v b="$t_psec" -v c="$promsec" -v d="$t_promsec" 'BEGIN{ printf "%.3f", (a-b)+(c-d) }')
+    if fcmp "$outtok" 0 ">" && fcmp "$e_j" 0 ">"; then
+      awk -v n="$outtok" -v e="$e_j" 'BEGIN{ printf "%.4f\n", n/e }' > "$TOKW.tmp" && mv "$TOKW.tmp" "$TOKW"
+      awk -v e="$e_j" -v s="$tsecs" 'BEGIN{ if (s>0) printf "%.1f\n", e/s }' > "$AVGW.tmp" && mv "$AVGW.tmp" "$AVGW"
+    fi
+    printf '%s %s %s %s\n' "$pred" "$psec" "$prom" "$promsec" > "$TANCHOR"
+    e_j=0
+  fi
+  if [[ "$busy" == 0 ]]; then
+    printf '%s %s %s %s\n' "$pred" "$psec" "$prom" "$promsec" > "$TANCHOR"
+    e_j=0
+  fi
+else
+  e_j=0
+fi
+printf '%s %s %s\n' "$e_j" "$now" "$busy" > "$ENERGY"
+
 last=$(cat "$LASTTPS" 2>/dev/null || true)
 
 # --- active model from config --------------------------------------------------
@@ -274,3 +363,6 @@ printf 'name=%s\n' "$name"
 printf 'backend=%s\n' "$backend"
 printf 'vram=%s\n' "${vram:-0}"
 printf 'vram_total=%s\n' "${vtotal:-0}"
+printf 'power_w=%s\n' "${pwr:-}"
+printf 'avg_w=%s\n' "$(cat "$AVGW" 2>/dev/null || true)"
+printf 'tok_w=%s\n' "$(cat "$TOKW" 2>/dev/null || true)"

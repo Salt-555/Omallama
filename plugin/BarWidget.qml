@@ -33,6 +33,9 @@ BarWidget {
   property real vramUsed: 0             // bytes
   property real vramTotal: 0            // bytes
   property string tpsLast: ""           // tok/s of the last completed run
+  property string powerW: ""            // instantaneous GPU power, watts
+  property string avgW: ""              // avg watts over the last completed turn
+  property string tokW: ""              // tokens/joule over the last completed turn
   property bool controlRunning: false
   // Service state is separate from health: during a model load the unit is
   // active but /health 503s. Buttons gate on this so a loading server can
@@ -80,6 +83,11 @@ BarWidget {
   readonly property string vramText: (vramTotal > 0)
     ? (vramUsed / 1073741824).toFixed(0) + "G/" + (vramTotal / 1073741824).toFixed(0) + "G"
     : "—"
+
+  readonly property string powerText: (powerW !== "") ? Number(powerW).toFixed(0) + "W" : ""
+  readonly property string avgWText: (avgW !== "") ? Number(avgW).toFixed(0) + "W" : ""
+  // tokens per joule over the last whole turn (prefill energy included)
+  readonly property string tokWText: (tokW !== "") ? Number(tokW).toFixed(3) + " tok/W" : ""
 
   function shortModel(id) {
     if (!id) return ""
@@ -213,6 +221,9 @@ BarWidget {
         else if (k === "tps_last") root.tpsLast = v
         else if (k === "tps_enc") root.tpsEnc = v
         else if (k === "ttft") root.ttftMs = v
+        else if (k === "power_w") root.powerW = v
+        else if (k === "avg_w") root.avgW = v
+        else if (k === "tok_w") root.tokW = v
         else if (k === "req_active") root.reqActive = v
         else if (k === "req_deferred") root.reqDeferred = v
         else if (k === "model") { root.model = v; root.currentModel = v }
@@ -311,6 +322,8 @@ BarWidget {
     dimmed: root.status !== "ok"
     tooltipText: "llama.cpp · " + root.activityLabel
       + (root.model ? " · " + root.shortModel(root.model) : "")
+      + (root.powerText ? " · " + root.powerText : "")
+      + (root.tokWText ? " · " + root.tokWText : "")
       + " · click for controls"
     onPressed: function(b) {
       if (b === Qt.RightButton) { root.refresh(); root.loadModels() }

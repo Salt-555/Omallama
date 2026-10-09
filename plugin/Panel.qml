@@ -93,6 +93,8 @@ Panel {
                      + " · " + ((s.tpsLast || "") ? "dec " + s.tpsLast : "dec —")
             },
             { label: "TTFT", value: (s.ttftMs || "") ? s.ttftMs + " ms" : "—" },
+            { label: "Power", value: (s.avgW || "") !== "" ? Number(s.avgW).toFixed(0) + " W avg" : ((s.powerW || "") !== "" ? Number(s.powerW).toFixed(0) + " W" : "—") },
+            { label: "Efficiency", value: (s.tokW || "") !== "" ? Number(s.tokW).toFixed(3) + " tok/W" : "—" },
             { label: "Req active", value: s.reqActive || "0" },
             { label: "Req deferred", value: s.reqDeferred || "0" },
             { label: "VRAM", value: s.vramText || "—" }

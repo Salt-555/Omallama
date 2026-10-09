@@ -1,8 +1,9 @@
 # Omallama
 
 An Omarchy (Quickshell) bar widget and control plane for managing a local
-llama.cpp `llama-server` — live status, VRAM, tok/s of the last run, and
-one-click model switching with automatic model discovery.
+llama.cpp `llama-server` — live status, VRAM, tok/s of the last run, GPU power
+and tokens-per-joule, and one-click model switching with automatic model
+discovery.
 
 ![status](https://img.shields.io/badge/port-6969-blue) ![platform](https://img.shields.io/badge/Omarchy-Quattro-purple)
 
@@ -13,7 +14,8 @@ one-click model switching with automatic model discovery.
   the decode tok/s of the last completed run. Click opens a control panel;
   right-click forces a poll refresh.
 - **Panel**: last-run rates (encode + decode tok/s), time to first token,
-  VRAM, start / restart / stop buttons, and a searchable model dropdown.
+  average power and tokens-per-joule over the last whole turn, VRAM, start /
+  restart / stop buttons, and a searchable model dropdown.
 - **Model discovery**: the dropdown is discovered live from disk
   (`~/.lmstudio/models` by default) every time it opens — new GGUFs appear
   automatically; projector files, draft models, and later shards are skipped.
@@ -21,11 +23,26 @@ one-click model switching with automatic model discovery.
   selected model to the right llama.cpp build (different forks for different
   architectures), so switching a model is just a `systemctl --user restart`.
 
+## Power and efficiency
+
+The panel reports GPU power and tokens-per-joule over the **whole turn**
+(prefill + decode), not decode alone. Energy is the integral of sampled power
+across the busy window, so the encoding cost is charged against the tokens it
+helped produce; the watt figure is that integral averaged over the turn, not a
+peak sample. Power is read from an NVIDIA card via `nvidia-smi` when one is
+present, otherwise the Strix Halo iGPU hwmon node.
+
+`gpu-power/` is a separate, root-only pair of scripts for running a card at
+its perf/watt knee: a steady power + core-clock ceiling for longevity, and an
+`efficiency-sweep.sh` that measures the curve so the operating point is chosen
+from data. See `gpu-power/README.md`.
+
 ## Repo layout
 
 ```
 plugin/    Omarchy plugin (manifest + QML widget + panel + shell scripts)
 config/    serve.sh dispatcher, systemd user unit, example presets
+gpu-power/ steady GPU power/clock profile + perf/watt sweep tooling (root)
 install.sh installer (never overwrites your existing config)
 ```
 
@@ -253,6 +270,7 @@ modelctl.sh add <path> [name]  # record a name/spec override
 - `jq`, `curl`, `systemd` user session
 - Docker (user in the `docker` group) for the Gufo backend only
 - AMD Strix Halo assumed for VRAM readout (`mem_info_vram_*`); falls back to "—"
+- Power readout: `nvidia-smi` when present, else the iGPU hwmon node
 
 ## License
 
