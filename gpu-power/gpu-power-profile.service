@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply steady-state GPU efficiency profile (power + core-clock ceiling)
+Documentation=file:/usr/local/lib/gpu-power/README.md
+# Needs the driver up before we can set power/clocks.
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Profile comes from this file; see README.md for the keys.
+EnvironmentFile=-/etc/gpu-power-profile.conf
+ExecStart=/usr/local/lib/gpu-power/apply-profile.sh
+
+[Install]
+WantedBy=multi-user.target
