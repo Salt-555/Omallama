@@ -36,8 +36,11 @@
 # It is generated tokens / joules, where joules is the integral of sampled power
 # across the busy window -- so the prefill (encoding) cost is charged against the
 # tokens it helped produce instead of being ignored. Power is read from the
-# NVIDIA card when present, else the iGPU hwmon node. The per-turn average watts
-# (AVGW) is the same integral over the server-reported prefill+decode seconds.
+# NVIDIA card when present, else the iGPU hwmon node. Each interval is a
+# trapezoid (mean of its two endpoint samples) and the busy wall-clock span is
+# accumulated with it, so AVGW is that integral over the SAME window -- not
+# energy over the server's prefill+decode seconds, a different clock that read
+# the average high.
 #
 # --- state (all scoped to ONE server session) ---------------------------------
 # The counters reset with the process, so any snapshot older than the current
@@ -63,7 +66,7 @@ LASTENC="$CFG/.last_tps_enc"
 LASTTTFT="$CFG/.last_ttft"
 TOKW="$CFG/.last_tokw"     # tokens/joule over the last completed turn
 AVGW="$CFG/.last_avgw"     # average watts over the last completed turn
-ENERGY="$CFG/.energy"      # "<joules> <last_ts> <last_busy>" power integrator
+ENERGY="$CFG/.energy"      # "<joules> <busy_secs> <last_ts> <last_busy> <last_pwr>"
 TANCHOR="$CFG/.turnanchor" # counters at the last idle: "<pred> <psec> <prom> <promsec>"
 
 # --- GPU power (watts) --------------------------------------------------------
@@ -285,14 +288,23 @@ fi
 # gap. Energy is the integral of sampled power across the busy window, so the
 # prefill (encoding) cost is inside the denominator, not ignored; averaging the
 # integral, not a peak sample, is what makes it a turn figure.
-read -r e_j e_ts e_busy < <(cat "$ENERGY" 2>/dev/null || echo "0 0 0")
-e_j=${e_j:-0}; e_ts=${e_ts:-0}; e_busy=${e_busy:-0}
-if [[ "$st" == "ok" ]] && [[ "$e_ts" -gt 0 ]] && [[ -n "${pwr:-}" ]]; then
+nowf=$(date +%s.%N)
+read -r e_j e_t e_ts e_busy e_pwr < <(cat "$ENERGY" 2>/dev/null || echo "0 0 0 0 ")
+e_j=${e_j:-0}; e_t=${e_t:-0}; e_ts=${e_ts:-0}; e_busy=${e_busy:-0}; e_pwr=${e_pwr:-}
+if [[ "$st" == "ok" ]] && awk -v b="$e_ts" 'BEGIN{exit !(b>0)}' && [[ -n "${pwr:-}" ]]; then
   # Only integrate across a sane gap; a sleep/hiccup must not inject energy.
-  dte=$(awk -v a="$now" -v b="$e_ts" 'BEGIN{ printf "%.2f", a-b }')
-  if awk -v d="$dte" 'BEGIN{ exit !(d>=0.25 && d<=10) }'; then
+  dte=$(awk -v a="$nowf" -v b="$e_ts" 'BEGIN{ printf "%.3f", a-b }')
+  if awk -v d="$dte" 'BEGIN{ exit !(d>0 && d<=10) }'; then
     if [[ "$busy" == 1 || "$e_busy" == 1 ]]; then
-      e_j=$(awk -v a="$e_j" -v w="$pwr" -v s="$dte" 'BEGIN{ printf "%.4f", a+w*s }')
+      # Trapezoid: half the previous sample's power plus half this one's. This
+      # is what stops the idle tail at each turn boundary being charged at the
+      # full busy power.
+      if [[ -n "$e_pwr" ]]; then
+        e_j=$(awk -v a="$e_j" -v p="$e_pwr" -v q="$pwr" -v s="$dte" 'BEGIN{ printf "%.4f", a + (p+q)/2*s }')
+      else
+        e_j=$(awk -v a="$e_j" -v q="$pwr" -v s="$dte" 'BEGIN{ printf "%.4f", a + q*s }')
+      fi
+      e_t=$(awk -v a="$e_t" -v s="$dte" 'BEGIN{ printf "%.3f", a+s }')
     fi
   fi
 fi
@@ -301,25 +313,24 @@ if [[ "$st" == "ok" ]]; then
   # Anchor = counters at the last idle. Both backends advance
   # tokens_predicted_total at request completion, so one rule covers llama + gufo.
   read -r t_pred t_psec t_prom t_promsec < <(cat "$TANCHOR" 2>/dev/null || echo "$pred $psec $prom $promsec")
-  t_pred=${t_pred:-$pred}; t_psec=${t_psec:-0}; t_promsec=${t_promsec:-0}
+  t_pred=${t_pred:-$pred}
   if fcmp "$pred" "$t_pred" ">"; then
     outtok=$(awk -v a="$pred" -v b="$t_pred" 'BEGIN{ printf "%.0f", a-b }')
-    tsecs=$(awk -v a="$psec" -v b="$t_psec" -v c="$promsec" -v d="$t_promsec" 'BEGIN{ printf "%.3f", (a-b)+(c-d) }')
     if fcmp "$outtok" 0 ">" && fcmp "$e_j" 0 ">"; then
       awk -v n="$outtok" -v e="$e_j" 'BEGIN{ printf "%.4f\n", n/e }' > "$TOKW.tmp" && mv "$TOKW.tmp" "$TOKW"
-      awk -v e="$e_j" -v s="$tsecs" 'BEGIN{ if (s>0) printf "%.1f\n", e/s }' > "$AVGW.tmp" && mv "$AVGW.tmp" "$AVGW"
+      awk -v e="$e_j" -v t="$e_t" 'BEGIN{ if (t>0) printf "%.1f\n", e/t }' > "$AVGW.tmp" && mv "$AVGW.tmp" "$AVGW"
     fi
     printf '%s %s %s %s\n' "$pred" "$psec" "$prom" "$promsec" > "$TANCHOR"
-    e_j=0
+    e_j=0; e_t=0
   fi
   if [[ "$busy" == 0 ]]; then
     printf '%s %s %s %s\n' "$pred" "$psec" "$prom" "$promsec" > "$TANCHOR"
-    e_j=0
+    e_j=0; e_t=0
   fi
 else
-  e_j=0
+  e_j=0; e_t=0
 fi
-printf '%s %s %s\n' "$e_j" "$now" "$busy" > "$ENERGY"
+printf '%s %s %s %s %s\n' "$e_j" "$e_t" "$nowf" "$busy" "${pwr:-}" > "$ENERGY"
 
 last=$(cat "$LASTTPS" 2>/dev/null || true)
 
