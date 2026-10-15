@@ -45,9 +45,9 @@ spec_for() {
   local p="${1,,}"
   case "$p" in
     *dflash2*)     echo "dflash" ;;
+    *gsq-rco*)     echo "mtp" ;;
     *qwen3.8-27b*) echo "dflash" ;;
     *rocmfp4*)     echo "mtp" ;;
-    *gsq-rco*)     echo "mtp" ;;
     *)             echo "" ;;
   esac
 }
@@ -65,7 +65,9 @@ resolve_spec() {
   spec_for "$sel"
 }
 
-# backend_for <model-path> -> gufo|llama. Gufo runs gufo-org's curated
+# backend_for <model-path> -> gufo|llama. SGLang is never reached here: it is
+# always chosen by an explicit preset "backend", since its target is a repo id
+# rather than a path. Gufo runs gufo-org's curated
 # artifacts on their own Strix Halo runtime; every other quant/fork stays on
 # a llama.cpp build. Keep this list in sync with gufo's docs/models table.
 backend_for() {
@@ -78,15 +80,15 @@ backend_for() {
   esac
 }
 
-# resolve_backend <name|path> [<resolved-path>] -> gufo|llama. The preset's
-# explicit "backend" wins; else the path rule from backend_for.
+# resolve_backend <name|path> [<resolved-path>] -> gufo|llama|sglang. The
+# preset's explicit "backend" wins; else the path rule from backend_for.
 resolve_backend() {
   local sel="${1:-}" path="${2:-${1:-}}" ov=""
   ov=$(jq -r --arg n "$sel" --arg p "$path" \
     '.[] | select(.exclude != true and (.name == $n or .model == $n or .model == $p)) | (.backend // "")' \
     "$PRESETS" 2>/dev/null | head -1 | tr '[:upper:]' '[:lower:]')
   case "$ov" in
-    gufo|llama) echo "$ov"; return ;;
+    gufo|llama|sglang) echo "$ov"; return ;;
   esac
   backend_for "$path"
 }
@@ -115,6 +117,17 @@ discover_models() {
     spec="${ospec:-$(spec_for "$f")}"
     printf '%s\t%s\t%s\n' "$label" "$f" "$spec"
   done
+  # Presets whose target is not a file here never match the find above, so they
+  # would be invisible in the widget's dropdown -- which is exactly the case for
+  # the SGLang preset, whose "model" is a HuggingFace repo id the container
+  # pulls itself. Emit those from the preset list directly.
+  jq -r '.[] | select(.exclude != true) | select((.backend // "") != "")
+         | [ (.name // ""), .model, (.spec // "") ] | @tsv' "$PRESETS" 2>/dev/null \
+  | while IFS=$'\t' read -r l m sp; do
+      [[ -n "$l" && -n "$m" ]] || continue
+      [[ -f "$m" ]] && continue        # a real file: already listed above
+      printf '%s\t%s\t%s\n' "$l" "$m" "${sp:-}"
+    done
 }
 
 case "${1:-}" in
@@ -135,16 +148,27 @@ case "${1:-}" in
     ensure_config
     sel="${2:-}"
     [[ -n "$sel" ]] || { echo "usage: modelctl.sh set <name|path>" >&2; exit 1; }
+    # The preset's declared backend decides whether the target must exist as a
+    # file here. The SGLang preset's "model" is a HuggingFace repo id that the
+    # container pulls for itself, so BOTH the file test and the on-disk
+    # discovery fallback are skipped for it -- checking after the fact is too
+    # late, because the discovery fallback has already overwritten the id with
+    # an empty hit. Every GGUF backend keeps the strict path check.
+    sel_backend=$(jq -r --arg n "$sel" '.[] | select(.name == $n) | (.backend // "")' "$PRESETS" 2>/dev/null | head -1)
     resolved=""
     if [[ -f "$sel" ]]; then
       resolved="$sel"
     else
       # override name first, then a generated discovery name
       resolved=$(jq -r --arg n "$sel" '.[] | select(.name == $n) | .model' "$PRESETS" 2>/dev/null | head -1)
-      [[ -n "$resolved" && -f "$resolved" ]] || \
-        resolved=$(discover_models | awk -F'\t' -v n="$sel" '$1 == n {print $2; exit}')
+      if [[ "$sel_backend" != "sglang" ]]; then
+        [[ -n "$resolved" && -f "$resolved" ]] || \
+          resolved=$(discover_models | awk -F'\t' -v n="$sel" '$1 == n {print $2; exit}')
+      fi
     fi
-    if [[ -z "$resolved" || ! -f "$resolved" ]]; then
+    if [[ "$sel_backend" == "sglang" ]]; then
+      [[ -n "$resolved" ]] || { echo "sglang preset has no model id: $sel" >&2; exit 1; }
+    elif [[ -z "$resolved" || ! -f "$resolved" ]]; then
       echo "model not found: $sel" >&2; exit 1
     fi
     # The selection (preset name when given) carries the intent; the path alone
