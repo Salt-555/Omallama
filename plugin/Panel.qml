@@ -58,7 +58,9 @@ Panel {
             color: s.statusColor || root.barForeground
           }
           Text {
-            text: (s.backend === "gufo" ? "Gufo" : "llama.cpp") + " · 6969"
+            text: (s.backend === "gufo" ? "Gufo"
+                   : s.backend === "sglang" ? "SGLang"
+                   : "llama.cpp") + " · 6969"
             color: root.barForeground
             font.family: Style.font.family
             font.pixelSize: Style.font.subtitle

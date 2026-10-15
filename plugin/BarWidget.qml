@@ -23,7 +23,13 @@ BarWidget {
   // counters only advance at request completion, so phase cannot come from
   // them). See monitor.sh's header for the measured numbers behind this.
   property string activity: "idle"
-  property string backend: "llama"          // runtime serving: llama | gufo
+  property string backend: "llama"          // runtime serving: llama | gufo | sglang
+  // Display name for whichever runtime the monitor reports, used by the bar
+  // tooltip and the panel header. Kept next to `backend` so a new backend
+  // only has to be named once.
+  readonly property string backendLabel: backend === "gufo" ? "Gufo"
+    : backend === "sglang" ? "SGLang"
+    : "llama.cpp"
   property string tpsEnc: ""               // last run: encode (prefill) t/s
   property string ttftMs: ""               // last run: time to first token, ms
   property string reqActive: "0"           // requests on a session right now
@@ -320,7 +326,7 @@ BarWidget {
     bar: root.bar
     text: root.barText
     dimmed: root.status !== "ok"
-    tooltipText: "llama.cpp · " + root.activityLabel
+    tooltipText: root.backendLabel + " · " + root.activityLabel
       + (root.model ? " · " + root.shortModel(root.model) : "")
       + (root.powerText ? " · " + root.powerText : "")
       + (root.tokWText ? " · " + root.tokWText : "")

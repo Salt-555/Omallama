@@ -36,7 +36,7 @@ if [[ -f "$MODEL_CONF" ]]; then
   TARGET=$(jq -r '.model // empty' "$MODEL_CONF" 2>/dev/null || true)
 fi
 [[ -n "$TARGET" && -f "$TARGET" ]] || \
-  TARGET="$MODELS_ROOT/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  TARGET="$MODELS_ROOT/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
 if [[ ! -f "$TARGET" ]]; then
   echo "target model not found: $TARGET" >&2
   exit 1
@@ -54,6 +54,7 @@ CT_MODEL="/models/$rel"
 # 4 x 65536 shape until they get their own numbers.
 case "$lower" in
   *flash-next*) DEF_SESSIONS=2; DEF_CONTEXT=130000 ;;
+  *qwen3.8-27b*) DEF_SESSIONS=1; DEF_CONTEXT=130000 ;;  # Salt: single 130k lane for 27B (overrides gufo's 2x32768 example)
   *)            DEF_SESSIONS=4; DEF_CONTEXT=65536 ;;
 esac
 SESSIONS="${GUFO_SESSIONS:-$DEF_SESSIONS}"
@@ -82,7 +83,9 @@ case "$lower" in
       CT_ARGS+=(--mmproj "/models/${MMPROJ#"$MODELS_ROOT"/}")
     fi
     ;;
-  *qwen3.8-27b-gguf/ud-*)
+  *qwen3.8-27b-gguf/*ud-q4_k_xl*|*qwen3.8-27b-gguf/*ud-q8_k_xl*)
+    # Pattern matches BOTH layouts: unsloth's flat file (Qwen3.8-27B-GGUF/
+    # Qwen3.8-27B-UD-Q4_K_XL.gguf) and a UD-<quant>/ subfolder if one appears.
     # Gufo qualifies the z-lab DFlash2 Q4_K_M at their pinned revision; prefer
     # it. The incoai copy on this box predates that cut (different content
     # hash), so it is only a fallback.
@@ -134,7 +137,7 @@ exec docker run --rm --init --name "$CONTAINER" --stop-timeout 15 \
   --device /dev/kfd --device /dev/dri \
   ${GROUP_ARGS[@]+"${GROUP_ARGS[@]}"} \
   --ulimit memlock=-1 \
-  -p "127.0.0.1:$PORT:$PORT" \
+  -p "$PORT:$PORT" \
   -v "$MODELS_ROOT:/models:ro" \
   -v "$CACHE_DIR:/cache" \
   "$IMAGE" \
@@ -143,5 +146,6 @@ exec docker run --rm --init --name "$CONTAINER" --stop-timeout 15 \
   "$SERVED_FLAG" "$SERVED_NAME" \
   --sessions "$SESSIONS" --context "$CONTEXT" \
   --cache-disk /cache \
+  --cache-ram-bytes 4294967296 \
   --log-progress \
   ${CT_ARGS[@]+"${CT_ARGS[@]}"}

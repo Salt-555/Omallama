@@ -1,5 +1,17 @@
 [
   { "name": "Example Model (MTP)", "model": "/path/to/model.gguf", "spec": "mtp" },
   { "name": "Example Gufo Model (MTP)", "model": "/path/to/gufo-quant.gguf", "spec": "mtp", "backend": "gufo" },
+  { "name": "Example SGLang (eGPU)", "model": "org/repo-id", "backend": "sglang",
+    "max_running_requests": 2, "mem_fraction_static": 0.98,
+    "context_length": 262144, "max_total_tokens": 262144,
+    "max_mamba_cache_size": 14, "kv_cache_dtype": "fp8_e4m3" },
+  { "name": "Example SGLang YaRN 524K (eGPU, 1 slot)", "model": "org/repo-id", "backend": "sglang",
+    "max_running_requests": 1, "mem_fraction_static": 0.98,
+    "context_length": 524288, "max_total_tokens": 524288,
+    "max_mamba_cache_size": 7, "kv_cache_dtype": "fp8_e4m3",
+    "speculative": false,
+    "rope_parameters": { "mrope_interleaved": true, "mrope_section": [11, 11, 10],
+      "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+      "factor": 2.0, "original_max_position_embeddings": 262144 } },
   { "model": "/path/to/draft-or-projector.gguf", "exclude": true }
 ]

@@ -69,6 +69,10 @@ AVGW="$CFG/.last_avgw"     # average watts over the last completed turn
 ENERGY="$CFG/.energy"      # "<joules> <busy_secs> <last_ts> <last_busy> <last_pwr>"
 TANCHOR="$CFG/.turnanchor" # counters at the last idle: "<pred> <psec> <prom> <promsec>"
 
+# Which runtime is configured, read once here because the health probe below
+# differs per backend: SGLang answers /health with 200 and an EMPTY body.
+cfg_backend=$(jq -r '.backend // empty' "$CFG/model.json" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+
 # --- GPU power (watts) --------------------------------------------------------
 # Prefer a discrete NVIDIA card when present (nvidia-smi), else the Strix Halo
 # iGPU via its hwmon node. Prints watts, or nothing when unknown.
@@ -103,7 +107,13 @@ fcmp() { awk -v a="$1" -v b="$2" -v op="$3" \
 # During a model load the unit is active while /health is not ok yet; the
 # widget needs both to show "loading" and to keep Stop/Restart reachable.
 st="down"
-if curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then
+if [[ "$cfg_backend" == "sglang" ]]; then
+  # SGLang's /health is 200 with an EMPTY body, so the llama.cpp
+  # `grep -q '"ok"'` test can never match it and the widget would read
+  # "offline" forever. Gate on the status code: 503 while a model loads.
+  _code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "$BASE/health" 2>/dev/null || echo 000)
+  [[ "$_code" == "200" ]] && st="ok"
+elif curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then
   st="ok"
 fi
 unit_state=$(systemctl --user is-active llama-server.service 2>/dev/null || true)
@@ -116,13 +126,35 @@ pwr="$(read_power)"
 pred=0; psec=0; ndec=0; proc=0; defer=0; prom=0; promsec=0
 if [[ "$st" == "ok" ]]; then
   metrics=$(curl -sf --max-time 2 "$BASE/metrics" 2>/dev/null)
-  pred=$(awk '/^llamacpp:tokens_predicted_total /{print $2; exit}' <<<"$metrics")
-  psec=$(awk '/^llamacpp:tokens_predicted_seconds_total /{print $2; exit}' <<<"$metrics")
-  ndec=$(awk '/^llamacpp:n_decode_total /{print $2; exit}' <<<"$metrics")
-  proc=$(awk '/^llamacpp:requests_processing /{print $2; exit}' <<<"$metrics")
-  defer=$(awk '/^llamacpp:requests_deferred /{print $2; exit}' <<<"$metrics")
-  prom=$(awk '/^llamacpp:prompt_tokens_total /{print $2; exit}' <<<"$metrics")
-  promsec=$(awk '/^llamacpp:prompt_seconds_total /{print $2; exit}' <<<"$metrics")
+  if [[ "$cfg_backend" == "sglang" ]]; then
+    # SGLang exposes sglang:* with verbose labels, so match on the family name
+    # and take the last field. Values are floats (122.0, 15.198226951000834);
+    # never feed them to $(( )) -- see the fcmp note above.
+    pred=$(awk '/^sglang:generation_tokens_total\{/{print $NF; exit}' <<<"$metrics")
+    prom=$(awk '/^sglang:prompt_tokens_total\{/{print $NF; exit}' <<<"$metrics")
+    proc=$(awk '/^sglang:num_running_reqs\{/{printf "%.0f", $NF; exit}' <<<"$metrics")
+    defer=$(awk '/^sglang:num_queue_reqs\{/{printf "%.0f", $NF; exit}' <<<"$metrics")
+    # SGLang publishes no decode-seconds counter (forward_execution_seconds_total
+    # is absent from the exposition), so the rate pair is total request latency.
+    # pred/psec is therefore tokens per second of REQUEST time, prefill
+    # included -- a different quantity from llama.cpp's
+    # tokens_predicted_seconds_total. Do not read the two as equivalent.
+    psec=$(awk '/^sglang:e2e_request_latency_seconds_sum\{/{print $NF; exit}' <<<"$metrics")
+    # Prefill pair: prompt tokens per second-to-first-token.
+    promsec=$(awk '/^sglang:time_to_first_token_seconds_sum\{/{print $NF; exit}' <<<"$metrics")
+    # Phase discriminator. There is no per-iteration decode counter, so reuse
+    # the generated-token counter: its rate is tokens/s, which straddles the
+    # same 2.0/s line below (generating ~150/s, chunked prefill ~0/s).
+    ndec="$pred"
+  else
+    pred=$(awk '/^llamacpp:tokens_predicted_total /{print $2; exit}' <<<"$metrics")
+    psec=$(awk '/^llamacpp:tokens_predicted_seconds_total /{print $2; exit}' <<<"$metrics")
+    ndec=$(awk '/^llamacpp:n_decode_total /{print $2; exit}' <<<"$metrics")
+    proc=$(awk '/^llamacpp:requests_processing /{print $2; exit}' <<<"$metrics")
+    defer=$(awk '/^llamacpp:requests_deferred /{print $2; exit}' <<<"$metrics")
+    prom=$(awk '/^llamacpp:prompt_tokens_total /{print $2; exit}' <<<"$metrics")
+    promsec=$(awk '/^llamacpp:prompt_seconds_total /{print $2; exit}' <<<"$metrics")
+  fi
   pred=${pred:-0}; psec=${psec:-0}; ndec=${ndec:-0}; proc=${proc:-0}; defer=${defer:-0}
   prom=${prom:-0}; promsec=${promsec:-0}
 fi
@@ -131,8 +163,10 @@ fi
 # completion-batched token counters plus the latest speed gauges: no
 # n_decode_total and no live request counters. Detect the shape and use its
 # own signals (journal request events) in the branch below.
-GUFO=0
-if [[ "$st" == "ok" ]] && ! grep -q '^llamacpp:n_decode_total ' <<<"${metrics:-}"; then
+GUFO=0; SGLANG=0
+if [[ "$cfg_backend" == "sglang" ]]; then
+  SGLANG=1
+elif [[ "$st" == "ok" ]] && ! grep -q '^llamacpp:n_decode_total ' <<<"${metrics:-}"; then
   GUFO=1
 fi
 
@@ -268,9 +302,18 @@ else
       awk -v a="$prom" -v b="$a_prom" -v x="$promsec" -v y="$a_promsec" \
         'BEGIN{ dt=a-b; ds=x-y; if (dt>0 && ds>0.001) printf "%.1f\n", dt/ds }' > "$LASTENC.tmp"
       if [[ -s "$LASTENC.tmp" ]]; then mv "$LASTENC.tmp" "$LASTENC"; else rm -f "$LASTENC.tmp"; fi
-      # llama-server /metrics carries no time-to-first-token; leave the panel
-      # cell empty rather than inventing one from prefill time.
-      rm -f "$LASTTTFT"
+      if [[ "$SGLANG" == 1 ]]; then
+        # SGLang is the one backend whose /metrics carries TTFT directly:
+        # sum/count is the mean over all requests served this session.
+        _ts=$(awk '/^sglang:time_to_first_token_seconds_sum\{/{print $NF; exit}' <<<"${metrics:-}")
+        _tc=$(awk '/^sglang:time_to_first_token_seconds_count\{/{print $NF; exit}' <<<"${metrics:-}")
+        awk -v s="${_ts:-0}" -v c="${_tc:-0}" 'BEGIN{ if (c>0) printf "%.0f\n", 1000*s/c }' > "$LASTTTFT.tmp"
+        if [[ -s "$LASTTTFT.tmp" ]]; then mv "$LASTTTFT.tmp" "$LASTTTFT"; else rm -f "$LASTTTFT.tmp"; fi
+      else
+        # llama-server /metrics carries no time-to-first-token; leave the panel
+        # cell empty rather than inventing one from prefill time.
+        rm -f "$LASTTTFT"
+      fi
     fi
     # Re-anchor whenever a run was measured or the server is idle, so the next
     # window starts from known-idle counters instead of inheriting a finished
@@ -346,18 +389,35 @@ name=$(jq -r '.name // empty' "$CFG/model.json" 2>/dev/null || true)
 cfg_backend=$(jq -r '.backend // empty' "$CFG/model.json" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
 backend="${cfg_backend:-llama}"
 if [[ "$st" == "ok" ]]; then
-  if [[ "$GUFO" == 1 ]]; then backend="gufo"; else backend="llama"; fi
+  if [[ "$SGLANG" == 1 ]]; then backend="sglang"
+  elif [[ "$GUFO" == 1 ]]; then backend="gufo"
+  else backend="llama"; fi
 fi
 
-# --- GPU VRAM (Radeon 8060S) ---------------------------------------------------
-# Take the first DRM card that reports VRAM rather than assuming card1.
+# --- GPU VRAM ------------------------------------------------------------------
+# Which GPU's memory is meaningful depends on the backend. The GGUF backends
+# serve on the Strix Halo iGPU, so the Radeon's carve is the right number there
+# (take the first DRM card that reports VRAM rather than assuming card1). The
+# SGLang backend runs on the discrete card behind the USB4 tunnel, so read the
+# NVIDIA card for it -- the power sample already comes from that card, and
+# pairing it with the idle iGPU's 32 GB carve made the panel incoherent.
 vram=""; vtotal=""
-for f in /sys/class/drm/card*/device/mem_info_vram_used; do
-  if [[ -r "$f" ]]; then vram=$(cat "$f"); break; fi
-done
-for f in /sys/class/drm/card*/device/mem_info_vram_total; do
-  if [[ -r "$f" ]]; then vtotal=$(cat "$f"); break; fi
-done
+if [[ "$cfg_backend" == "sglang" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  # nvidia-smi reports MiB; the widget renders bytes / 1073741824.
+  read -r _used _total < <(nvidia-smi --query-gpu=memory.used,memory.total \
+    --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' | tr ',' ' ')
+  if [[ "$_used" =~ ^[0-9]+$ && "$_total" =~ ^[0-9]+$ ]]; then
+    vram=$(( _used * 1048576 )); vtotal=$(( _total * 1048576 ))
+  fi
+fi
+if [[ -z "$vram" ]]; then
+  for f in /sys/class/drm/card*/device/mem_info_vram_used; do
+    if [[ -r "$f" ]]; then vram=$(cat "$f"); break; fi
+  done
+  for f in /sys/class/drm/card*/device/mem_info_vram_total; do
+    if [[ -r "$f" ]]; then vtotal=$(cat "$f"); break; fi
+  done
+fi
 
 printf 'status=%s\n' "$st"
 printf 'service=%s\n' "$unit_state"

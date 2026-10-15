@@ -37,6 +37,12 @@ if [[ ! -f "$CFG_DST/serve-gufo.sh" ]]; then
 else
   echo "    serve-gufo.sh exists, left untouched"
 fi
+if [[ ! -f "$CFG_DST/serve-sglang.sh" ]]; then
+  cp -v "$SRC/config/serve-sglang.sh" "$CFG_DST/"
+  chmod +x "$CFG_DST/serve-sglang.sh"
+else
+  echo "    serve-sglang.sh exists, left untouched"
+fi
 if [[ ! -f "$CFG_DST/presets.json" ]]; then
   cp -v "$SRC/config/presets.example.json" "$CFG_DST/presets.json"
 else

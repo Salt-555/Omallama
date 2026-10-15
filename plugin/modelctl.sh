@@ -180,6 +180,21 @@ case "${1:-}" in
     name=$(jq -r --arg n "$sel" '.[] | select(.name == $n) | .name' "$PRESETS" 2>/dev/null | head -1)
     jq -n --arg m "$resolved" --arg s "$spec" --arg n "$name" --arg b "$backend" \
       '{model: $m, spec: $s, backend: $b} + (if $n != "" then {name: $n} else {} end)' > "$MODEL"
+    # SGLang tuning keys live on the preset (context_length, max_total_tokens,
+    # max_running_requests, max_mamba_cache_size, mem_fraction_static,
+    # kv_cache_dtype, speculative, rope_parameters) and must survive into
+    # model.json: serve-sglang.sh reads them from THERE, not from presets.
+    # GGUF presets carry none of them, so the merge is a no-op for those.
+    jq --arg n "$sel" -s '
+      .[0] as $model | .[1] as $presets
+      | ($presets | map(select(.name == $n))[0] // {}) as $p
+      | reduce (
+          "context_length", "max_total_tokens", "max_running_requests",
+          "max_mamba_cache_size", "mem_fraction_static", "kv_cache_dtype",
+          "speculative", "rope_parameters"
+        ) as $k
+        ($model; if $p[$k] != null then .[$k] = $p[$k] else . end)
+    ' "$MODEL" "$PRESETS" > "$MODEL.tmp" && mv "$MODEL.tmp" "$MODEL"
     echo "$resolved"
     ;;
   resolve-backend)

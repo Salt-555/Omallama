@@ -218,6 +218,10 @@ Environment variables (all optional, defaults shown):
 | `GUFO_SESSIONS` | `4` | config/serve-gufo.sh |
 | `GUFO_CONTEXT` | `65536` | config/serve-gufo.sh |
 | `GUFO_CACHE_DIR` | `~/.cache/gufo` | config/serve-gufo.sh (runtime + artifact digest cache) |
+| `SGLANG_HF_CACHE` | `~/.cache/huggingface` | config/serve-sglang.sh (bind-mounted into the container) |
+| `SGLANG_IMAGE` | `lmsysorg/sglang:dev-qwen38-next-local` | config/serve-sglang.sh |
+| `SGLANG_PORT` / `SGLANG_SERVED_NAME` | `6969` / `ALLMIND` | config/serve-sglang.sh |
+| `WATCHDOG_MEM_GIB` | `3` | config/serve-sglang.sh (host watchdog stops the container below this) |
 
 Edit `config/serve.sh` to add or change routes — it pattern-matches the active
 model path and execs the right build. Each target build's serve script owns its
@@ -238,9 +242,28 @@ stripped). Use `presets.json` to override a name or spec, or to hide a file:
 
 `spec` (`dflash` / `mtp`) is written into `model.json` on selection; the spec
 rule lives in one place (`modelctl.sh`'s `spec_for`), which also guesses from
-the filename for unknown models. `backend` (`gufo` / `llama`) forces the
-serving runtime for that preset and wins over the automatic path rule; run
-`modelctl.sh resolve-backend <path>` to see what would be chosen.
+the filename for unknown models. `backend` (`gufo` / `llama` / `sglang`)
+forces the serving runtime for that preset and wins over the automatic path
+rule; run `modelctl.sh resolve-backend <path>` to see what would be chosen.
+
+A preset with `"backend": "sglang"` takes a HuggingFace **repo id** (the
+container pulls it itself), not a file path, and may carry SGLang tuning keys
+that `modelctl.sh set` copies verbatim into `model.json` for
+`config/serve-sglang.sh` to read:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `context_length` | `262144` | `--context-length` |
+| `max_total_tokens` | `262144` | KV pool size — the real window |
+| `max_running_requests` | `2` | request slots |
+| `max_mamba_cache_size` | `14` | mamba state pool (scale with slots) |
+| `mem_fraction_static` | `0.98` | `--mem-fraction-static` |
+| `kv_cache_dtype` | `fp8_e4m3` | needs the QSA fp8 overlay (bound by the script) |
+| `speculative` | `true` | `false` drops the NEXTN/MTP flags (draft acceptance collapses at deep positions) |
+| `rope_parameters` | — | static YaRN via `--json-model-override-args`, per the model card's SGLang recipe (e.g. factor `2.0` for 524,288 context; `context_length` > 262,144 also gets `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`) |
+
+Static YaRN applies at every length, so keep a normal preset for everyday
+serving and switch to the YaRN preset only for long-horizon jobs.
 
 ## CLI
 
@@ -250,7 +273,7 @@ serving runtime for that preset and wins over the automatic path rule; run
 modelctl.sh presets            # name<TAB>path<TAB>spec, discovered from disk
 modelctl.sh current            # active model path
 modelctl.sh set <name|path>    # switch (widget then restarts the service)
-modelctl.sh resolve-backend <name|path>  # gufo|llama: which runtime serves it
+modelctl.sh resolve-backend <name|path>  # gufo|llama|sglang: serving runtime
 modelctl.sh add <path> [name]  # record a name/spec override
 ```
 
