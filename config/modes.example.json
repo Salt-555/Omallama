@@ -1,0 +1,21 @@
+{
+  "default_mode": "llm",
+  "gen_idle_minutes": 30,
+  "llm_drain_cap_seconds": 600,
+  "min_dwell_seconds": 120,
+  "sglang_min_free_mib": 90000,
+  "gen_min_free_mib": 40000,
+  "comfy_url": "http://127.0.0.1:8189",
+  "llm_url": "http://127.0.0.1:6969",
+  "gate_port": 8190,
+  "modes": {
+    "llm": {
+      "preset": "Flash-Next NVFP4 (SGLang, eGPU)",
+      "ready_timeout": 600
+    },
+    "gen": {
+      "preset": "Qwen3.8-27B GSQ-RCO IQ3_S (MTP)",
+      "ready_timeout": 180
+    }
+  }
+}

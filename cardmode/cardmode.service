@@ -1,0 +1,17 @@
+[Unit]
+Description=Blackwell card-mode reconciler (omallama cardmode)
+Documentation=file:///home/salt/.local/lib/omallama-cardmode/cardmode.py
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/omallama-cardmode/cardmode.py
+# Fail-closed gate: the arbiter IS the comfy admission path, so it must come
+# back on its own. Restart=always + RestartSec=1 makes a crash a blip, not an
+# outage. Transitions are idempotent (mode is derived from model.json).
+Restart=always
+RestartSec=1
+Nice=5
+
+[Install]
+WantedBy=default.target

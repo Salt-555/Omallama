@@ -1,0 +1,17 @@
+[Unit]
+Description=ComfyUI front proxy (cardmode gate, :8188 -> comfy :8189)
+After=network.target cardmode.service
+# Wants, not Requires: if cardmode is down the proxy still runs and the
+# auth_request subrequest fails -> prompts are refused (fail closed) while
+# GET traffic keeps flowing for inspection.
+Wants=cardmode.service
+
+[Service]
+ExecStartPre=/usr/bin/mkdir -p %h/.local/state/cardmode/run %h/.local/state/cardmode/logs
+ExecStart=/usr/sbin/nginx -p %h/.local/state/cardmode -c %h/.config/cardmode/nginx.conf -g "daemon off;"
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

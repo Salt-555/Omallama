@@ -97,6 +97,28 @@ if (( CTX > NATIVE_CTX )); then
   LONGCTX_ENV=(--env SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1)
 fi
 
+# --- card handoff guard -------------------------------------------------------
+# SGLang reserves the card at --mem-fraction-static (~94 of 96 GiB), so the
+# card must actually be empty when this starts. ComfyUI on this box is
+# loopback :8189 behind the cardmode gate; ask it to evict (documented:
+# returns VRAM to ~0.7 GB in seconds), then wait for nvidia-smi to agree
+# BEFORE launching -- at 0.98 a starved startup malloc dies with Restart=no
+# and a dead unit in the widget. Thresholds live in modes.json
+# (sglang_min_free_mib); this guard covers EVERY path into llm mode, manual
+# widget switch included. Best-effort: a missing comfy must not block serving.
+COMFY_URL="${COMFY_URL:-http://127.0.0.1:8189}"
+MIN_FREE_MIB=$(jq -r '.sglang_min_free_mib // 90000' "$HOME/.config/llama-server/modes.json" 2>/dev/null || echo 90000)
+curl -sf --max-time 10 -X POST "$COMFY_URL/free" \
+  -H 'content-type: application/json' \
+  -d '{"unload_models": true, "free_memory": true}' >/dev/null 2>&1 || true
+for _ in $(seq 1 18); do
+  FREE_MIB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')
+  [[ -z "$FREE_MIB" ]] && break                      # no card/no nvidia-smi: proceed
+  (( FREE_MIB >= MIN_FREE_MIB )) && break
+  echo "sglang: card handoff: free ${FREE_MIB} MiB < ${MIN_FREE_MIB} MiB, waiting" >&2
+  sleep 5
+done
+
 # A stale container from a previous run would hold the port and 94 GB of VRAM.
 if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
   echo "removing leftover container $CONTAINER" >&2

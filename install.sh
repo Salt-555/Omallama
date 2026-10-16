@@ -3,8 +3,9 @@
 #
 # Copies the plugin into ~/.config/omarchy/plugins/salt.llama-server and the
 # control-plane config into ~/.config/llama-server, then rescans the shell.
-# Existing config (presets.json, model.json, serve.sh, serve-gufo.sh) is NEVER
-# overwritten — re-running is safe and only refreshes plugin code.
+# Existing config (presets.json, model.json, modes.json, serve.sh,
+# serve-gufo.sh, cardmode nginx.conf) is NEVER overwritten — re-running is
+# safe and only refreshes plugin code.
 #
 # Per Omarchy semantics this script deliberately does NOT call
 # `omarchy plugin enable`: enable goes over IPC to the running shell and
@@ -48,6 +49,22 @@ if [[ ! -f "$CFG_DST/presets.json" ]]; then
 else
   echo "    presets.json exists, left untouched"
 fi
+if [[ ! -f "$CFG_DST/modes.json" ]]; then
+  cp -v "$SRC/config/modes.example.json" "$CFG_DST/modes.json"
+else
+  echo "    modes.json exists, left untouched"
+fi
+
+echo "==> installing cardmode (Blackwell card-mode reconciler + comfy gate)"
+mkdir -p "$HOME/.local/lib/omallama-cardmode"
+cp -v "$SRC/cardmode/cardmode.py" "$HOME/.local/lib/omallama-cardmode/"
+if [[ ! -f "$HOME/.config/cardmode/nginx.conf" ]]; then
+  mkdir -p "$HOME/.config/cardmode"
+  cp -v "$SRC/cardmode/nginx.conf" "$HOME/.config/cardmode/"
+else
+  echo "    cardmode nginx.conf exists, left untouched"
+fi
+cp -v "$SRC/cardmode/"{cardmode.service,cardmode-proxy.service} "$HOME/.config/systemd/user/"
 
 echo "==> systemd user unit"
 mkdir -p "$HOME/.config/systemd/user"

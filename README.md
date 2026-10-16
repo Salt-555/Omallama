@@ -41,7 +41,8 @@ from data. See `gpu-power/README.md`.
 
 ```
 plugin/    Omarchy plugin (manifest + QML widget + panel + shell scripts)
-config/    serve.sh dispatcher, systemd user unit, example presets
+config/    serve.sh dispatcher, systemd user unit, example presets, modes.example.json
+cardmode/  Blackwell card-mode reconciler: daemon + nginx gate + systemd units
 gpu-power/ steady GPU power/clock profile + perf/watt sweep tooling (root)
 install.sh installer (never overwrites your existing config)
 ```
@@ -286,12 +287,46 @@ modelctl.sh add <path> [name]  # record a name/spec override
 4. Widget polls `/health` + `/metrics` until the new model reports ok (with a
    watchdog so a failed load surfaces as an error, not an eternal spinner).
 
+## Card modes (cardmode, optional — machines with a Blackwell eGPU + ComfyUI)
+
+The eGPU can hold exactly one resident shape at a time: the SGLang
+Flash-Next cell (~94 of 96 GiB, mode `llm`) or a 27B llama.cpp CUDA serve +
+ComfyUI working set (mode `gen`). `cardmode/` automates the handoff:
+
+- **cardmode.service** (python stdlib, `~/.local/lib/omallama-cardmode/`) is
+  the single owner of mode transitions. Mode is DERIVED from `model.json`'s
+  preset name, so manual widget switches are self-adopted, never fought.
+- **cardmode-proxy.service** runs a user nginx instance as the public ComfyUI
+  door: nginx `:8188` -> comfy loopback `:8189`. Every `POST /prompt` (and
+  the `/api/prompt` mirror) authenticates via `auth_request` against the
+  reconciler, which HOLDS the request while it switches the card into `gen`
+  mode and forwards it only when the switch succeeds. Nothing can load
+  diffusion models ahead of the handoff. NB: auth subrequests arrive as GET
+  regardless of the parent method — the arbiter decides on the
+  `X-Original-Method` header that the gate location sets.
+- `~/.config/llama-server/modes.json` maps mode names to `presets.json`
+  preset names plus policy knobs: `gen_idle_minutes` (revert after comfy
+  goes quiet), `llm_drain_cap_seconds` (LLM traffic wins contention: the
+  gate waits for :6969 to drain, then answers 503 rather than killing work),
+  `min_dwell_seconds` (anti-thrash), `sglang_min_free_mib` /
+  `gen_min_free_mib` (VRAM release is verified via `nvidia-smi` between
+  stop and start — the outgoing allocation must be gone before it's
+  measured, and sglang at mem-fraction 0.98 dies on a starved malloc).
+  `serve-sglang.sh` carries the same guard as a backstop, so a MANUAL widget
+  switch into llm mode also frees comfy first (`POST /free`).
+- Policy: the gate FAILS CLOSED — cardmode down means comfy prompts get 500,
+  never blind forwarding; `Restart=always` makes that a ~1 s blip.
+- Endpoints: `127.0.0.1:8190/status` (state JSON), `/switch?mode=llm|gen`
+  (manual force), `/gate` (nginx internal). Logs: `journalctl --user -u cardmode`.
+
 ## Requirements
 
 - Omarchy (Quattro shell / Quickshell) for the widget
 - llama.cpp server builds reachable at the paths in `config/serve.sh`
 - `jq`, `curl`, `systemd` user session
 - Docker (user in the `docker` group) for the Gufo backend only
+- cardmode: nginx installed (user instance, no root), `nvidia-smi` on PATH,
+  and ComfyUI listening on loopback `:8189` with nginx owning the public `:8188`
 - AMD Strix Halo assumed for VRAM readout (`mem_info_vram_*`); falls back to "—"
 - Power readout: `nvidia-smi` when present, else the iGPU hwmon node
 
