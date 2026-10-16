@@ -130,18 +130,31 @@ if [[ "$st" == "ok" ]]; then
     # SGLang exposes sglang:* with verbose labels, so match on the family name
     # and take the last field. Values are floats (122.0, 15.198226951000834);
     # never feed them to $(( )) -- see the fcmp note above.
-    pred=$(awk '/^sglang:generation_tokens_total\{/{print $NF; exit}' <<<"$metrics")
-    prom=$(awk '/^sglang:prompt_tokens_total\{/{print $NF; exit}' <<<"$metrics")
-    proc=$(awk '/^sglang:num_running_reqs\{/{printf "%.0f", $NF; exit}' <<<"$metrics")
-    defer=$(awk '/^sglang:num_queue_reqs\{/{printf "%.0f", $NF; exit}' <<<"$metrics")
+    # NB: counters SPLIT by the is_streaming label (measured 2026-10-15):
+    # streaming clients (Hermes) land on a different series than plain curls.
+    # A first-match 'print $NF; exit' read silently sees only one series --
+    # the tok/s math then divides a near-empty counter. SUM all matching lines.
+    pred=$(awk '/^sglang:generation_tokens_total\{/{s+=$NF} END{printf "%.1f", s+0}' <<<"$metrics")
+    prom=$(awk '/^sglang:prompt_tokens_total\{/{s+=$NF} END{printf "%.1f", s+0}' <<<"$metrics")
+    proc=$(awk '/^sglang:num_running_reqs\{/{s+=$NF} END{printf "%.0f", s+0}' <<<"$metrics")
+    defer=$(awk '/^sglang:num_queue_reqs\{/{s+=$NF} END{printf "%.0f", s+0}' <<<"$metrics")
     # SGLang publishes no decode-seconds counter (forward_execution_seconds_total
     # is absent from the exposition), so the rate pair is total request latency.
     # pred/psec is therefore tokens per second of REQUEST time, prefill
     # included -- a different quantity from llama.cpp's
     # tokens_predicted_seconds_total. Do not read the two as equivalent.
-    psec=$(awk '/^sglang:e2e_request_latency_seconds_sum\{/{print $NF; exit}' <<<"$metrics")
-    # Prefill pair: prompt tokens per second-to-first-token.
-    promsec=$(awk '/^sglang:time_to_first_token_seconds_sum\{/{print $NF; exit}' <<<"$metrics")
+    psec=$(awk '/^sglang:e2e_request_latency_seconds_sum\{/{s+=$NF} END{printf "%.6f", s+0}' <<<"$metrics")
+    # Prefill pair. prompt_tokens is NOT the prefill work: radix-cache hits
+    # land in the same counter (measured: 5.1M device_hit vs ~350k actually
+    # computed). For an honest encode rate use the prefill-COMPUTE counter
+    # over prefill seconds ~= TTFT minus queue time. The anchor layout stays
+    # "pred psec prom promsec" for all backends; only the sglang branch
+    # redefines what prom/promsec hold.
+    promsec=$(awk '/^sglang:time_to_first_token_seconds_sum\{/{s+=$NF} END{printf "%.6f", s+0}' <<<"$metrics")
+    peff=$(awk '/^sglang:prefill_effective_tokens_total\{.*mode="input"/{s+=$NF} END{printf "%.1f", s+0}' <<<"$metrics")
+    tq=$(awk '/^sglang:queue_time_seconds_sum\{/{s+=$NF} END{printf "%.6f", s+0}' <<<"$metrics")
+    prom="${peff:-0}"
+    promsec=$(awk -v t="${promsec:-0}" -v q="${tq:-0}" 'BEGIN{d=t-q; if(d<0)d=0; printf "%.6f", d}')
     # Phase discriminator. There is no per-iteration decode counter, so reuse
     # the generated-token counter: its rate is tokens/s, which straddles the
     # same 2.0/s line below (generating ~150/s, chunked prefill ~0/s).
@@ -305,8 +318,9 @@ else
       if [[ "$SGLANG" == 1 ]]; then
         # SGLang is the one backend whose /metrics carries TTFT directly:
         # sum/count is the mean over all requests served this session.
-        _ts=$(awk '/^sglang:time_to_first_token_seconds_sum\{/{print $NF; exit}' <<<"${metrics:-}")
-        _tc=$(awk '/^sglang:time_to_first_token_seconds_count\{/{print $NF; exit}' <<<"${metrics:-}")
+        # Sum across is_streaming series like the counter block above.
+        _ts=$(awk '/^sglang:time_to_first_token_seconds_sum\{/{s+=$NF} END{print s+0}' <<<"${metrics:-}")
+        _tc=$(awk '/^sglang:time_to_first_token_seconds_count\{/{s+=$NF} END{print s+0}' <<<"${metrics:-}")
         awk -v s="${_ts:-0}" -v c="${_tc:-0}" 'BEGIN{ if (c>0) printf "%.0f\n", 1000*s/c }' > "$LASTTTFT.tmp"
         if [[ -s "$LASTTTFT.tmp" ]]; then mv "$LASTTTFT.tmp" "$LASTTTFT"; else rm -f "$LASTTTFT.tmp"; fi
       else
