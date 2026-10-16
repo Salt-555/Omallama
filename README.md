@@ -317,7 +317,14 @@ ComfyUI working set (mode `gen`). `cardmode/` automates the handoff:
 - Policy: the gate FAILS CLOSED — cardmode down means comfy prompts get 500,
   never blind forwarding; `Restart=always` makes that a ~1 s blip.
 - Endpoints: `127.0.0.1:8190/status` (state JSON), `/switch?mode=llm|gen`
-  (manual force), `/gate` (nginx internal). Logs: `journalctl --user -u cardmode`.
+  (manual force), `/enable?on=0|1` (smart-mode master switch), `/gate`
+  (nginx internal). Logs: `journalctl --user -u cardmode`.
+- **Widget toggle**: the panel's `Auto: on/off` button flips
+  `/enable?on=` via monitor's `smart=` key. OFF = gate pass-through and idle
+  revert stands down (pre-cardmode semantics, headroom guard only); it does
+  NOT unload anything — freeing the card is still Stop (llama-server) plus
+  comfy's own eviction. Re-arming resets the idle timer (no instant revert
+  on a timer that was frozen while off).
 
 ## Requirements
 
