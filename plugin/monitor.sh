@@ -435,6 +435,14 @@ fi
 
 printf 'status=%s\n' "$st"
 printf 'service=%s\n' "$unit_state"
+# Smart mode: the cardmode reconciler's auto-switch flag. Missing state file
+# = no reconciler here, so "off" is the honest display; .enabled==false is
+# the widget's manual toggle position.
+smart="off"
+if [[ -f "$CFG/.cardmode.json" ]]; then
+  smart=$(jq -r 'if .enabled == false then "off" else "on" end' "$CFG/.cardmode.json" 2>/dev/null || echo on)
+fi
+printf 'smart=%s\n' "$smart"
 printf 'activity=%s\n' "$activity"
 printf 'req_active=%s\n' "$proc"
 printf 'req_deferred=%s\n' "$defer"

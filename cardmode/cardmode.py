@@ -102,6 +102,7 @@ class Engine:
             "last_switch_ts": 0.0,
             "last_gen_activity": time.time(),
             "switching": False,
+            "enabled": True,
             "note": "boot",
         }
         self.last_revert_try = 0.0
@@ -308,9 +309,13 @@ class Engine:
     def handle_gate(self, method: str = "GET") -> tuple[int, str]:
         """nginx auth_request target. 200 = prompt may proceed on comfy.
         The auth subrequest inherits the original method; GET /prompt is just
-        queue info, only POSTs are demand. Fail closed on any anomaly."""
+        queue info, only POSTs are demand. Fail closed on any anomaly.
+        Smart mode off = instant pass-through (pre-cardmode semantics: the
+        comfy headroom guard is the only remaining protection)."""
         if method == "GET":
             return 200, "open:get"
+        if not self.st.get("enabled", True):
+            return 200, "open:auto-off"
         cfg = load_cfg()
         cur, _ = self.current_mode(cfg)
         if cur == "gen":
@@ -332,7 +337,7 @@ class Engine:
             if self.comfy_busy(cfg):
                 self.st["last_gen_activity"] = time.time()
                 self.save()
-            if cur == "gen":
+            if cur == "gen" and self.st.get("enabled", True):
                 idle_s = float(cfg["gen_idle_minutes"]) * 60
                 if time.time() - self.st["last_gen_activity"] > idle_s:
                     if time.time() - self.last_revert_try < 60:
@@ -354,6 +359,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _route(self) -> None:
+        try:
+            self._dispatch()
+        except Exception as e:  # noqa: BLE001 - never hang nginx on a bug
+            import traceback
+
+            log(f"handler error: {e!r}\n{traceback.format_exc()}")
+            try:
+                self._reply(500, f"cardmode error: {e}\n")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _dispatch(self) -> None:
         u = urlparse(self.path)
         if u.path in ("/gate", "/gate/"):
             # nginx auth subrequests arrive as GET; the parent method rides in
@@ -377,6 +394,22 @@ class Handler(BaseHTTPRequestHandler):
                 gpu_free_mib=self.engine.gpu_free_mib(),
             )
             self._reply(200, json.dumps(st, indent=2) + "\n")
+        elif u.path == "/enable":
+            # Smart-mode master switch (the widget toggle). Off = gate passes
+            # prompts straight through and the idle timer stands down; it
+            # never unloads anything -- residency stays llama-server's job.
+            eng = self.engine
+            on = (parse_qs(u.query).get("on") or ["1"])[0]
+            enabled = on not in ("0", "false", "off")
+            eng.st["enabled"] = enabled
+            if enabled:
+                # Grace: re-arming must not instantly revert a freshly idle
+                # gen mode with a timer that was frozen while disarmed.
+                eng.st["last_gen_activity"] = time.time()
+            eng.st["note"] = f"smart mode {'ON' if enabled else 'OFF'}"
+            eng.save()
+            log(eng.st["note"])
+            self._reply(200, eng.st["note"] + "\n")
         elif u.path == "/switch":
             mode = (parse_qs(u.query).get("mode") or [""])[0]
             if mode not in ("llm", "gen"):

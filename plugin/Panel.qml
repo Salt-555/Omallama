@@ -164,7 +164,7 @@ Panel {
           Button {
             text: "Start"
             leftAlign: true
-            width: (parent.width - parent.spacing * 2) / 3
+            width: (parent.width - parent.spacing * 3) / 4
             foreground: root.barForeground
             // qs.Ui.Button has no disabled visual — dim it explicitly so an
             // unavailable action reads as unavailable (house pattern:
@@ -176,7 +176,7 @@ Panel {
           Button {
             text: "Restart"
             leftAlign: true
-            width: (parent.width - parent.spacing * 2) / 3
+            width: (parent.width - parent.spacing * 3) / 4
             foreground: root.barForeground
             opacity: enabled ? 1.0 : 0.35
             enabled: s.serviceActive
@@ -185,11 +185,22 @@ Panel {
           Button {
             text: "Stop"
             leftAlign: true
-            width: (parent.width - parent.spacing * 2) / 3
+            width: (parent.width - parent.spacing * 3) / 4
             foreground: root.barForeground
             opacity: enabled ? 1.0 : 0.35
             enabled: s.serviceActive
             onClicked: s.serverControl("stop")
+          }
+          // cardmode smart mode: gate-held comfy prompts + auto llm/gen
+          // handoff. Off does NOT unload anything — use Stop for residency.
+          Button {
+            text: s.smart === "on" ? "Auto: on" : "Auto: off"
+            leftAlign: true
+            width: (parent.width - parent.spacing * 3) / 4
+            foreground: root.barForeground
+            opacity: enabled ? 1.0 : 0.35
+            enabled: !!s.smartToggle
+            onClicked: s.smartToggle()
           }
         }
       }

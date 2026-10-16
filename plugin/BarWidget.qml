@@ -48,6 +48,12 @@ BarWidget {
   // still be stopped/restarted from the panel.
   property bool serviceActive: false
 
+  // cardmode smart-switch flag (monitor key "smart"): on = comfy prompts are
+  // gate-held and the card auto-hands-off between llm/gen modes; off = the
+  // gate passes prompts through and the idle revert stands down. Toggling
+  // never unloads anything — residency stays llama-server's job (Stop).
+  property string smart: "off"
+
   // ---- model selector ------------------------------------------------------
   property var modelOptions: []          // [{value,label,description}]
   // Written by the poll (model.json's path) and optimistically by switchModel
@@ -118,6 +124,16 @@ BarWidget {
     statusNote = ""
     controlProc.command = ["systemctl", "--user", action, "llama-server.service"]
     controlProc.running = true
+  }
+
+  // Flip the cardmode smart-switcher (gate hold + auto handoff). Local HTTP,
+  // not systemctl: the reconciler owns its own flag and persists it.
+  function smartToggle() {
+    if (smartProc.running) return
+    statusNote = ""
+    smartProc.command = ["curl", "-sf", "--max-time", "5", "-X", "POST",
+      "http://127.0.0.1:8190/enable?on=" + (root.smart === "on" ? "0" : "1")]
+    smartProc.running = true
   }
 
   // sel is a preset name or path; modelctl.sh resolves either.
@@ -237,6 +253,7 @@ BarWidget {
         else if (k === "vram") root.vramUsed = parseFloat(v) || 0
         else if (k === "vram_total") root.vramTotal = parseFloat(v) || 0
         else if (k === "service") root.serviceActive = (v === "active")
+        else if (k === "smart") root.smart = v
       }
     }
   }
@@ -301,6 +318,14 @@ BarWidget {
       } else if (root.modelSwitching) {
         root.statusNote = ""
       }
+      Qt.callLater(root.refresh)
+    }
+  }
+
+  Process {
+    id: smartProc
+    onExited: function(code) {
+      if (code !== 0) root.statusNote = "cardmode unreachable (exit " + code + ")"
       Qt.callLater(root.refresh)
     }
   }
