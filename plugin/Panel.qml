@@ -68,14 +68,55 @@ Panel {
           }
           Item { width: 1; height: 1 }
           Text {
-            // Literal phaseWord: activityLabel doesn't exist on the Panel base,
-            // so reading it before injectPanel wires hostWidget logged
-            // "Unable to assign [undefined] to QString" on every load.
-            text: s.phaseWord || s.activityLabel || "…"
+            // The card's job, in the user's words (Chat / Images / Manual).
+            text: s.modeLabel || ""
+            anchors.verticalCenter: parent.verticalCenter
+            color: root.barForeground
+            opacity: 0.85
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+          Text {
+            // activityLabel first: phaseWord is always defined on the host
+            // ("idle"), so reading it first pinned this to "idle" even when the
+            // dot went urgent for loading/offline/draining.
+            text: s.activityLabel || s.phaseWord || "…"
             anchors.verticalCenter: parent.verticalCenter
             color: s.statusColor || root.barForeground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
+          }
+        }
+
+        // ---- card mode ------------------------------------------------------
+        // The one choice that matters: what the GPU is set up for. Both
+        // buttons ask cardmode, which owns drain/dwell/handoff, so they never
+        // race it; progress shows up in the note line below.
+        Row {
+          width: parent.width
+          spacing: Style.spacing.controlGap
+          Button {
+            text: "Chat"
+            leftAlign: true
+            width: (parent.width - parent.spacing) / 2
+            selected: s.mode === "llm"
+            enabled: !!s.switchMode && !s.modeSwitchRunning
+                     && s.cardmodeSwitching !== "true" && !s.controlRunning
+            opacity: enabled ? 1.0 : 0.35
+            foreground: root.barForeground
+            onClicked: s.switchMode("llm")
+          }
+          Button {
+            text: "Images"
+            leftAlign: true
+            width: (parent.width - parent.spacing) / 2
+            selected: s.mode === "gen"
+            enabled: !!s.switchMode && !s.modeSwitchRunning
+                     && s.cardmodeSwitching !== "true" && !s.controlRunning
+            opacity: enabled ? 1.0 : 0.35
+            foreground: root.barForeground
+            onClicked: s.switchMode("gen")
           }
         }
 
@@ -103,13 +144,13 @@ Panel {
           ]
           Repeater {
             model: statusColumn.rows
-            // Label 40% + symmetric 2% gutters + value 56% = exact fit, so the
-            // value's elipsis lands at the panel edge, not one gutter past it.
+            // Label 40% + 2% gutter + value 58% = full width, so the value's
+            // ellipsis lands at the panel edge instead of one gutter short.
             Row {
               width: parent.width
               Text { width: parent.width * 0.4; text: modelData.label; color: root.barForeground; opacity: 0.6; font.family: Style.font.family; font.pixelSize: Style.font.body }
               Item { width: parent.width * 0.02 }
-              Text { width: parent.width * 0.56; elide: Text.ElideRight; text: modelData.value; color: root.barForeground; font.family: Style.font.family; font.pixelSize: Style.font.body }
+              Text { width: parent.width * 0.58; elide: Text.ElideRight; text: modelData.value; color: root.barForeground; font.family: Style.font.family; font.pixelSize: Style.font.body }
             }
           }
         }
@@ -151,6 +192,34 @@ Panel {
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
         }
+        Text {
+          // The reconciler's own voice: what cardmode is doing (a handoff in
+          // flight, ours or a comfy prompt's) or last refused. "timed out" is
+          // listed because a switch that never came up is a failure too -- it
+          // used to be the one silent failure class.
+          visible: (s.cardmodeSwitching === "true") || s.modeSwitchRunning
+                   || /blocked|aborted|failed|unloaded|timed out/.test(String(s.cardmodeNote || ""))
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: s.cardmodeNote || (s.modeSwitchRunning ? "asking cardmode to switch…" : "")
+          color: s.statusColor || root.barForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Text {
+          // Only a dead server earns a sentence. `failed` is the state that
+          // never self-heals (Restart=no by design, and cardmode's idle timer
+          // only acts in gen mode), so the reason and the way out belong on
+          // screen instead of a bare "offline".
+          visible: s.serviceFailed === true
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: "llama-server died (" + (s.serviceExit || "?") + ") — nothing restarts it, press Start"
+          color: s.urgentColor || root.barForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
 
         // ---- controls --------------------------------------------------------
         // Buttons gate on the systemd unit state, not health: while a model is
@@ -164,43 +233,84 @@ Panel {
           Button {
             text: "Start"
             leftAlign: true
-            width: (parent.width - parent.spacing * 3) / 4
+            // Three per row: "Smart: off" needs more than a quarter of 320px.
+            width: (parent.width - parent.spacing * 2) / 3
             foreground: root.barForeground
             // qs.Ui.Button has no disabled visual — dim it explicitly so an
             // unavailable action reads as unavailable (house pattern:
             // PanelActionButton dims to Qt.darker when !enabled).
             opacity: enabled ? 1.0 : 0.35
+            // Never offer Start while cardmode owns the handoff: the unit
+            // reads "deactivating" mid-switch, which used to light this button
+            // up exactly when pressing it could start a second owner.
             enabled: s.status !== "ok" && !s.serviceActive
+                     && s.cardmodeSwitching !== "true" && !s.modeSwitchRunning
             onClicked: s.serverControl("start")
           }
           Button {
             text: "Restart"
             leftAlign: true
-            width: (parent.width - parent.spacing * 3) / 4
+            width: (parent.width - parent.spacing * 2) / 3
             foreground: root.barForeground
             opacity: enabled ? 1.0 : 0.35
-            enabled: s.serviceActive
+            enabled: s.serviceActive && s.cardmodeSwitching !== "true"
             onClicked: s.serverControl("restart")
           }
           Button {
             text: "Stop"
             leftAlign: true
-            width: (parent.width - parent.spacing * 3) / 4
+            width: (parent.width - parent.spacing * 2) / 3
             foreground: root.barForeground
             opacity: enabled ? 1.0 : 0.35
-            enabled: s.serviceActive
+            enabled: s.serviceActive && s.cardmodeSwitching !== "true"
             onClicked: s.serverControl("stop")
           }
-          // cardmode smart mode: gate-held comfy prompts + auto llm/gen
-          // handoff. Off does NOT unload anything — use Stop for residency.
+        }
+
+        // Chatterbox TTS on the Blackwell (:8880) — its own row because it's
+        // a separate service with its own lifecycle, not a llama-server
+        // control. Starts in seconds (weights page-cached), first call ~9 s.
+        Row {
+          width: parent.width
+          spacing: Style.spacing.controlGap
+
+          // Smart mode: cardmode's arbiter flag. On = the gate holds comfy
+          // prompts until the card is handed over and gen-mode idles back to
+          // llm; off = prompts pass straight through and the idle revert
+          // stands down. Residency is still llama-server's job (Stop).
           Button {
-            text: s.smart === "on" ? "Auto: on" : "Auto: off"
+            text: s.smart === "on" ? "Smart: on" : "Smart: off"
             leftAlign: true
-            width: (parent.width - parent.spacing * 3) / 4
+            width: (parent.width - parent.spacing * 2) / 3
+            selected: s.smart === "on"
             foreground: root.barForeground
             opacity: enabled ? 1.0 : 0.35
             enabled: !!s.smartToggle
             onClicked: s.smartToggle()
+          }
+
+          Button {
+            text: s.comfy === "on" ? "Comfy: on" : "Comfy: off"
+            leftAlign: true
+            // Third of the row minus the two gaps: `parent.width` here made the
+            // row twice the panel wide and painted this pair past the card edge.
+            width: (parent.width - parent.spacing * 2) / 3
+            selected: s.comfy === "on"
+            foreground: root.barForeground
+            opacity: enabled ? 1.0 : 0.35
+            enabled: !!s.comfyToggle && !s.comfyToggleRunning
+            onClicked: s.comfyToggle()
+          }
+
+          Button {
+            text: s.tts === "on" ? "TTS: on" : "TTS: off"
+            leftAlign: true
+            width: (parent.width - parent.spacing) / 2
+            selected: s.tts === "on"
+            foreground: root.barForeground
+            opacity: enabled ? 1.0 : 0.35
+            enabled: !!s.ttsToggle && !s.ttsToggleRunning
+            onClicked: s.ttsToggle()
           }
         }
       }

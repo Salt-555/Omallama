@@ -1,21 +1,28 @@
 [Unit]
 Description=llama.cpp server (port 6969) - model dispatcher
+Documentation=file://%h/CodingProjects/llamacpp-strix-halo/README.md
 After=graphical-session.target
 Wants=graphical-session.target
-# Deliberately NOT enabled at boot: starting this service loads a 40-90GB
-# model into unified memory. Autostart belongs to a conscious decision, not
-# to a login. `systemctl --user enable llama-server` only if you want the
-# model resident from boot.
 
 [Service]
 Type=simple
 ExecStart=%h/.config/llama-server/serve.sh
+# Stop at the layer that owns the process: dockerd SIGTERMs the container,
+# waits -t 240, then SIGKILLs THE CONTAINER ITSELF and reaps it (--rm cleans
+# up). systemd SIGKILLing the docker run CLI orphans the container instead --
+# on 2026-10-16 it survived holding ~94 GiB and :6969. For the GGUF backends
+# no such container exists and this is a no-op. -t 240 < TimeoutStopSec below.
+ExecStop=/bin/sh -c '/usr/bin/docker stop -t 240 sglang-llm >/dev/null 2>&1 || true'
+# Backstop above ExecStop's docker wait. sglang's graceful drain of one long
+# streaming reply measured ~5 min; 300 covers the 240 s docker stop + margin.
+TimeoutStopSec=300
 WorkingDirectory=%h/.config/llama-server
-# Restart=no on purpose: with on-failure, a model that OOMs or a serve.sh
-# that exits nonzero gets retried into a crash loop, each attempt re-loading
-# the whole model. A dead server is a visible "offline" in the widget; press
-# Start when you want it back.
+# Restart=no on purpose: a failing model load must not be retried into a
+# crash loop. Dead server = visible "offline" in the widget; press Start.
 Restart=no
+
+# Strix Halo unified memory: keep 96GB GPU VRAM carve-out available to the
+# Radeon 8060S. Lower IOpriority so interactive apps win on CPU.
 IOSchedulingClass=idle
 
 [Install]

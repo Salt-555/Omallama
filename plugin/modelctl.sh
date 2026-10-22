@@ -191,7 +191,8 @@ case "${1:-}" in
       | reduce (
           "context_length", "max_total_tokens", "max_running_requests",
           "max_mamba_cache_size", "mem_fraction_static", "kv_cache_dtype",
-          "speculative", "rope_parameters"
+          "speculative", "rope_parameters", "ple_offload_embedding",
+          "cuda_graph_max_bs_decode"
         ) as $k
         ($model; if $p[$k] != null then .[$k] = $p[$k] else . end)
     ' "$MODEL" "$PRESETS" > "$MODEL.tmp" && mv "$MODEL.tmp" "$MODEL"

@@ -116,8 +116,25 @@ if [[ "$cfg_backend" == "sglang" ]]; then
 elif curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then
   st="ok"
 fi
+# Verbatim unit state, NOT a bool. Collapsing everything that is not "active"
+# into "inactive" erased the one distinction the operator needs: `inactive`
+# means someone pressed Stop (leave it alone), `failed` means something died
+# and nothing will restart it (Restart=no, deliberately). The bar and panel
+# render those two differently, so the raw word travels through.
 unit_state=$(systemctl --user is-active llama-server.service 2>/dev/null || true)
-[[ "$unit_state" == "active" ]] || unit_state="inactive"
+unit_state=${unit_state%%$'\n'*}
+[[ -n "$unit_state" ]] || unit_state="unknown"
+
+# --- resident: is the sglang container actually alive on the card? ------------
+# /health and unit state cannot see it: during a graceful drain sglang answers
+# /health 503 while still serving at full speed and holding ~94 GiB, and after
+# a stop-timeout SIGKILL of the docker CLI the container survives ORPHANED in
+# dockerd's cgroup, still bound to :6969 (2026-10-16). Only docker's own view
+# settles residency; empty means no such container exists.
+resident=""
+if [[ "$cfg_backend" == "sglang" ]]; then
+  resident=$(docker inspect -f '{{.State.Running}}' sglang-llm 2>/dev/null || true)
+fi
 
 # Instantaneous GPU power for this poll (also the raw sample fed to the peak
 # tracker below).
@@ -416,7 +433,25 @@ fi
 # NVIDIA card for it -- the power sample already comes from that card, and
 # pairing it with the idle iGPU's 32 GB carve made the panel incoherent.
 vram=""; vtotal=""
-if [[ "$cfg_backend" == "sglang" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+# Which card MATTERS: the one hosting the model on :6969. SGLang is known to
+# sit on the discrete card; the gen-mode 27B is a CUDA build of llama-server
+# on the same card (it holds ~41 GiB there), and gating this on "sglang" made
+# the panel report the idle iGPU's carve instead -- exactly in the mode where
+# the number is needed, because Comfy loads onto that card next.
+nvidia_hosts_llm=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  if [[ "$cfg_backend" == "sglang" ]]; then
+    nvidia_hosts_llm=1
+  else
+    _llm_pid=$(systemctl --user show -p MainPID --value llama-server.service 2>/dev/null || true)
+    if [[ -n "${_llm_pid:-}" && "$_llm_pid" != "0" ]] \
+      && ls -l "/proc/$_llm_pid/fd" 2>/dev/null | grep -q nvidia0; then
+      nvidia_hosts_llm=1
+    fi
+    unset _llm_pid
+  fi
+fi
+if [[ -n "$nvidia_hosts_llm" ]]; then
   # nvidia-smi reports MiB; the widget renders bytes / 1073741824.
   read -r _used _total < <(nvidia-smi --query-gpu=memory.used,memory.total \
     --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' | tr ',' ' ')
@@ -434,7 +469,26 @@ if [[ -z "$vram" ]]; then
 fi
 
 printf 'status=%s\n' "$st"
+# Three states: ok (serving), draining (/health not ok but the sglang
+# container still runs: graceful exit, orphan, or a load in progress), down
+# (nothing resident). status= is kept for the two-value contract of any
+# loaded widget predating this key.
+state="down"
+[[ "$st" == "ok" ]] && state="ok"
+if [[ "$st" != "ok" && "$resident" == "true" ]]; then state="draining"; fi
+printf 'state=%s\n' "$state"
+printf 'resident=%s\n' "$resident"
 printf 'service=%s\n' "$unit_state"
+# How it died, for the panel's failure line. Empty unless the unit is failed:
+# ExecMainStatus is the exit code, or the signal number when Result=signal.
+# Only meaningful together, so they travel as one value ("137/exit-code").
+unit_exit=""
+if [[ "$unit_state" == "failed" ]]; then
+  _res=$(systemctl --user show -p Result --value llama-server.service 2>/dev/null || true)
+  _code=$(systemctl --user show -p ExecMainStatus --value llama-server.service 2>/dev/null || true)
+  [[ -n "$_res" || -n "$_code" ]] && unit_exit="${_code:-?} ${_res:-?}"
+fi
+printf 'exit=%s\n' "$unit_exit"
 # Smart mode: the cardmode reconciler's auto-switch flag. Missing state file
 # = no reconciler here, so "off" is the honest display; .enabled==false is
 # the widget's manual toggle position.
@@ -443,6 +497,32 @@ if [[ -f "$CFG/.cardmode.json" ]]; then
   smart=$(jq -r 'if .enabled == false then "off" else "on" end' "$CFG/.cardmode.json" 2>/dev/null || echo on)
 fi
 printf 'smart=%s\n' "$smart"
+printf 'switching=%s\n' "$(jq -r 'if .switching == true then "true" else "false" end' "$CFG/.cardmode.json" 2>/dev/null || echo false)"
+# GPU mode: which resident shape owns the Blackwell, derived the same way
+# cardmode derives it -- model.json's NAME matched against modes.json's
+# preset map. Empty = no mode preset is loaded (a hand-picked model) or no
+# modes.json on this machine; the widget renders those as "manual".
+mode=""
+if [[ -f "$CFG/modes.json" && -f "$CFG/model.json" ]]; then
+  mode=$(jq -r --slurpfile mj "$CFG/model.json" \
+    '(.modes // {}) | to_entries[] | select(.value.preset == ($mj[0].name // "")) | .key' \
+    "$CFG/modes.json" 2>/dev/null | head -1 || true)
+fi
+printf 'mode=%s\n' "$mode"
+# The reconciler's own note: what cardmode did last / is doing (transition,
+# block or abort reason). Cardmode's voice, verbatim.
+printf 'note=%s\n' "$(jq -r '.note // empty' "$CFG/.cardmode.json" 2>/dev/null || true)"
+# TTS: the Chatterbox user unit on the Blackwell (:8880). Its own lifecycle,
+# never a cardmode mode; cardmode only bounces it around sglang's malloc.
+tts="off"
+[[ "$(systemctl --user is-active chatterbox.service 2>/dev/null || true)" == "active" ]] && tts="on"
+printf 'tts=%s\n' "$tts"
+# ComfyUI: the Blackwell CUDA user unit (:8189 behind the :8188 gate). Its
+# own lifecycle like TTS -- cardmode never starts or stops it. Stopping it
+# in gen mode means the gate passes but nginx has nothing to proxy to.
+comfy="off"
+[[ "$(systemctl --user is-active comfyui.service 2>/dev/null || true)" == "active" ]] && comfy="on"
+printf 'comfy=%s\n' "$comfy"
 printf 'activity=%s\n' "$activity"
 printf 'req_active=%s\n' "$proc"
 printf 'req_deferred=%s\n' "$defer"

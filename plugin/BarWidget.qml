@@ -46,13 +46,57 @@ BarWidget {
   // Service state is separate from health: during a model load the unit is
   // active but /health 503s. Buttons gate on this so a loading server can
   // still be stopped/restarted from the panel.
-  property bool serviceActive: false
+  // The RAW systemd state as monitor.sh reads it: active | activating |
+  // deactivating | failed | inactive. It travels verbatim because the two dead
+  // states mean opposite things to whoever is looking: `inactive` is a Stop
+  // somebody pressed, `failed` is a server that died with Restart=no and no
+  // path back except Start. Collapsing them into one bool is what made a
+  // watchdog kill look like a manual stop.
+  property string serviceState: ""
+  readonly property bool serviceActive: serviceState === "active" || serviceState === "activating"
+  readonly property bool serviceFailed: serviceState === "failed"
+  // "137/exit-code" while failed, empty otherwise (monitor key "exit").
+  property string serviceExit: ""
 
   // cardmode smart-switch flag (monitor key "smart"): on = comfy prompts are
   // gate-held and the card auto-hands-off between llm/gen modes; off = the
   // gate passes prompts through and the idle revert stands down. Toggling
   // never unloads anything — residency stays llama-server's job (Stop).
   property string smart: "off"
+  // Chatterbox TTS on the Blackwell (monitor key "tts"): a separate user
+  // unit on :8880 with its own lifecycle, independent of llm/gen cardmode.
+  property string tts: "off"
+  readonly property bool ttsToggleRunning: ttsProc.running
+  // ComfyUI server on the Blackwell (:8189 behind the :8188 gate): a plain
+  // user unit with its own lifecycle, exactly like TTS. Off = the whole
+  // setup closed; cardmode never resurrects it.
+  property string comfy: "off"
+  readonly property bool comfyToggleRunning: comfyProc.running
+
+  // cardmode reconciler voice (monitor keys "state"/"resident"/"switching"/
+  // "note"): draining = /health not ok but the sglang container still runs
+  // (graceful exit, orphan, or a load in progress); note = cardmode's last
+  // action or refusal, shown in the panel only when it is news.
+  property string state: "down"            // ok | draining | down
+  property string resident: ""             // sglang container running: "true"/"false"
+  property string cardmodeSwitching: "false"
+  property string cardmodeNote: ""
+  // Which resident shape owns the card right now: llm | gen | "" (no mode
+  // preset loaded = a hand-picked model). Derived in monitor.sh from
+  // model.json + modes.json, exactly like cardmode derives it.
+  property string mode: ""
+  // Display vocabulary. The mode is the card's job, not a model name: "Chat"
+  // is the Flash-Next cell, "Images" is the 27B + ComfyUI shape. "Smart" is
+  // the arbiter flag that lets cardmode move between them by itself.
+  // mode is the SELECTION in model.json, so on its own it keeps claiming
+  // "Chat" long after the server died and gave the card back. With nothing
+  // resident there is no shape to name; show the dash until it is back.
+  readonly property string modeLabel: (state === "down" && !serviceActive) ? "—"
+    : mode === "llm" ? "Chat"
+    : mode === "gen" ? "Images"
+    : (status === "ok" ? "Manual" : "—")
+  property string modeTarget: ""           // mode a switch is heading to
+  readonly property bool modeSwitchRunning: modeSwitchProc.running
 
   // ---- model selector ------------------------------------------------------
   property var modelOptions: []          // [{value,label,description}]
@@ -88,9 +132,11 @@ BarWidget {
     : activity === "encoding" ? "encoding"
     : activity
 
-  readonly property string activityLabel: status === "down"
-    ? (serviceActive ? "loading" : "offline")
-    : phaseWord
+  readonly property string activityLabel: state === "draining"
+    ? "draining"
+    : status === "down"
+      ? (serviceFailed ? "crashed" : serviceActive ? "loading" : "offline")
+      : phaseWord
 
   readonly property string vramText: (vramTotal > 0)
     ? (vramUsed / 1073741824).toFixed(0) + "G/" + (vramTotal / 1073741824).toFixed(0) + "G"
@@ -111,7 +157,11 @@ BarWidget {
   // only update at request completion, so no live t/s exists), else the last
   // completed run's speed, else the offline marker.
   readonly property string barText: {
-    if (status === "down") return serviceActive ? "llm …" : "llm ✕"
+    if (state === "draining") return "llm ⟳"
+    // Three distinct faces, because they lead to different actions: a
+    // deliberate stop (✕) is fine to ignore, a crash (⚠) needs a Start, and a
+    // load in flight (…) needs patience.
+    if (status === "down") return serviceFailed ? "llm ⚠" : serviceActive ? "llm …" : "llm ✕"
     if (activity !== "idle") return phaseGlyph
     if (tpsLast !== "") return tpsLast + " t/s"
     return "llm"
@@ -134,6 +184,40 @@ BarWidget {
     smartProc.command = ["curl", "-sf", "--max-time", "5", "-X", "POST",
       "http://127.0.0.1:8190/enable?on=" + (root.smart === "on" ? "0" : "1")]
     smartProc.running = true
+  }
+
+  // Ask the reconciler to move the card. cardmode owns dwell/drain/handoff,
+  // so this call BLOCKS until the switch lands or refuses (up to its cap);
+  // the process is async and the poll surfaces switching/note meanwhile.
+  function switchMode(target) {
+    if (modeSwitchProc.running || controlProc.running || modelSetProc.running) return
+    if (target === root.mode) return
+    root.modeTarget = target
+    root.statusNote = ""
+    modeSwitchProc.command = ["curl", "-sS", "--max-time", "900",
+      "http://127.0.0.1:8190/switch?mode=" + target]
+    modeSwitchProc.running = true
+  }
+
+  // TTS is a plain systemd toggle, not an HTTP flag: it's a separate user
+  // unit (chatterbox.service) that cardmode bounces around the sglang malloc.
+  // No debounce — systemctl's exit is the result; ttsProc re-polls on exit.
+  // ComfyUI is a plain systemd toggle like TTS. No debounce -- systemctl's
+  // exit is the result; comfyProc re-polls on exit.
+  function comfyToggle() {
+    if (comfyProc.running) return
+    statusNote = ""
+    comfyProc.command = ["systemctl", "--user",
+      root.comfy === "on" ? "stop" : "start", "comfyui.service"]
+    comfyProc.running = true
+  }
+
+  function ttsToggle() {
+    if (ttsProc.running) return
+    statusNote = ""
+    ttsProc.command = ["systemctl", "--user",
+      root.tts === "on" ? "stop" : "start", "chatterbox.service"]
+    ttsProc.running = true
   }
 
   // sel is a preset name or path; modelctl.sh resolves either.
@@ -252,8 +336,16 @@ BarWidget {
         else if (k === "name") root.modelName = v
         else if (k === "vram") root.vramUsed = parseFloat(v) || 0
         else if (k === "vram_total") root.vramTotal = parseFloat(v) || 0
-        else if (k === "service") root.serviceActive = (v === "active")
+        else if (k === "service") root.serviceState = v
+        else if (k === "exit") root.serviceExit = v
         else if (k === "smart") root.smart = v
+        else if (k === "tts") root.tts = v
+        else if (k === "comfy") root.comfy = v
+        else if (k === "state") root.state = v
+        else if (k === "mode") root.mode = v
+        else if (k === "resident") root.resident = v
+        else if (k === "switching") root.cardmodeSwitching = v
+        else if (k === "note") root.cardmodeNote = v
       }
     }
   }
@@ -323,9 +415,46 @@ BarWidget {
   }
 
   Process {
+    id: comfyProc
+    onExited: function(code) {
+      // systemctl's exit is the failure signal: a start that fails to bind
+      // or load must say so instead of silently reverting the toggle.
+      if (code !== 0) root.statusNote = "comfy " + (root.comfy === "on" ? "stop" : "start") + " failed (exit " + code + ")"
+      Qt.callLater(root.refresh)
+    }
+  }
+
+  Process {
+    id: modeSwitchProc
+    // cardmode answers "ok: ..." (200) or "failed: ..." (503) as the body, so
+    // the reply text IS the result -- no status parsing needed, and a refusal
+    // ("llm still busy after 600s") lands in statusNote verbatim.
+    stdout: StdioCollector { id: modeOut; waitForEnd: true }
+    onExited: function(code) {
+      var out = String((modeOut.text || "")).trim()
+      root.modeTarget = ""
+      if (out.indexOf("ok:") !== 0) {
+        root.statusNote = out !== "" ? out.replace(/^failed:\s*/, "")
+          : "mode switch failed (exit " + code + ")"
+      }
+      Qt.callLater(root.refresh)
+    }
+  }
+
+  Process {
     id: smartProc
     onExited: function(code) {
       if (code !== 0) root.statusNote = "cardmode unreachable (exit " + code + ")"
+      Qt.callLater(root.refresh)
+    }
+  }
+
+  Process {
+    id: ttsProc
+    onExited: function(code) {
+      // systemctl's exit is the failure signal: a start that fails to bind or
+      // load must say so instead of silently reverting the optimistic toggle.
+      if (code !== 0) root.statusNote = "tts " + (root.tts === "on" ? "stop" : "start") + " failed (exit " + code + ")"
       Qt.callLater(root.refresh)
     }
   }
@@ -351,7 +480,7 @@ BarWidget {
     bar: root.bar
     text: root.barText
     dimmed: root.status !== "ok"
-    tooltipText: root.backendLabel + " · " + root.activityLabel
+    tooltipText: root.modeLabel + " · " + root.backendLabel + " · " + root.activityLabel
       + (root.model ? " · " + root.shortModel(root.model) : "")
       + (root.powerText ? " · " + root.powerText : "")
       + (root.tokWText ? " · " + root.tokWText : "")
