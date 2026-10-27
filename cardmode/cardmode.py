@@ -65,6 +65,7 @@ from urllib.parse import parse_qs, urlparse
 CFG_DIR = Path.home() / ".config/llama-server"
 MODES_FILE = CFG_DIR / "modes.json"
 MODEL_JSON = CFG_DIR / "model.json"
+PRESETS_FILE = CFG_DIR / "presets.json"
 STATE_FILE = CFG_DIR / ".cardmode.json"
 MODELCTL = Path.home() / ".config/omarchy/plugins/salt.llama-server/modelctl.sh"
 SGLANG_CONTAINER = "sglang-llm"  # serve-sglang.sh's --name; ours to reap
@@ -168,24 +169,53 @@ class Engine:
                 return mname, mj
         return "manual", mj
 
+    def preset_for_mode(self, cfg: dict, mode: str) -> dict:
+        """The shape a mode DECLARES (modes.json -> presets.json). Never from
+        model.json: that records what was last selected, which is exactly what
+        an identity check must not vouch for."""
+        name = ((cfg.get("modes") or {}).get(mode) or {}).get("preset")
+        if not name:
+            return {}
+        try:
+            for p in json.loads(PRESETS_FILE.read_text()):
+                if p.get("name") == name:
+                    return p
+        except Exception:  # noqa: BLE001 - unreadable declaration: no shape gate
+            pass
+        return {}
+
     def ready_for(self, cfg: dict, mode: str) -> bool:
         """IDENTITY, not liveness. Anything answering :6969 satisfies a
         liveness check -- on 2026-10-16 an orphaned sglang container
         (health 503, still holding ~94 GiB) answered /v1/models with ALLMIND
         and a gen switch that never happened was logged as done in 0s. The
-        runtime is named by its own metric families (the monitor.sh
-        contract): sglang:* for llm, llamacpp:* plus the ALLMIND id for gen."""
+        runtime names itself through its metric families (the monitor.sh
+        contract): sglang:* or llamacpp:* plus the ALLMIND id.
+        Which family proves WHICH mode is the preset's business now, not the
+        mode name's: llm mode may run sglang or llama.cpp. And since one
+        llama.cpp build serves both our 27B shapes, family alone cannot tell a
+        gen boot from an llm boot -- so a preset that pins n_parallel must also
+        see /props total_slots match it."""
         url = cfg["llm_url"]
+        want = self.preset_for_mode(cfg, mode)
+        backend = (want.get("backend") or "").lower()
+        if not backend:  # preset without a declared backend: historic mapping
+            backend = "sglang" if mode == "llm" else "llama"
         try:
             status, body = http(url + "/metrics", timeout=3)
             if status != 200:
                 return False
-            if mode == "llm":
+            if backend == "sglang":
                 return "sglang:" in body
             if "llamacpp:" not in body:
                 return False
             _, models = http(url + "/v1/models", timeout=3)
-            return "ALLMIND" in models
+            if "ALLMIND" not in models:
+                return False
+            if want.get("n_parallel") is not None:
+                _, props = http(url + "/props", timeout=3)
+                return json.loads(props).get("total_slots") == int(want["n_parallel"])
+            return True
         except Exception:  # noqa: BLE001 - fail closed
             return False
 
@@ -296,12 +326,19 @@ class Engine:
         return rc == 0
 
     def llm_runtime_evidence(self, cfg: dict) -> bool:
-        """True when :6969 is (or is becoming) an sglang runtime: the
-        sglang-llm container running, or sglang metric families present.
-        A container mid-load answers neither /metrics nor /health yet --
-        the container name is the only early signal (2026-10-17 revert
-        killed a healthy Flash-Next boot because model.json still named
-        the gen preset)."""
+        """True when :6969 is (or is becoming) the runtime llm mode DECLARES.
+        For an sglang llm mode: the sglang-llm container running, or sglang
+        metric families present. A container mid-load answers neither /metrics
+        nor /health yet -- the container name is the only early signal
+        (2026-10-17 revert killed a healthy Flash-Next boot because model.json
+        still named the gen preset).
+        A llama.cpp llm mode has no container, so the identity check carries
+        it: ready_for matches the metric family AND /props total_slots, which a
+        gen-shape llama.cpp on the same file cannot fake. Same blind spot the
+        container path has: a llama.cpp boot that has not bound :6969 yet is
+        invisible, and the revert pays one reload."""
+        if (self.preset_for_mode(cfg, "llm").get("backend") or "").lower() == "llama":
+            return self.ready_for(cfg, "llm")
         try:
             rc, out = sh("docker", "inspect", "-f", "{{.State.Running}}", SGLANG_CONTAINER, timeout=10)
             if rc == 0 and out.strip() == "true":

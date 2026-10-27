@@ -110,12 +110,24 @@ discover_models() {
     is_excluded "$f" && continue
     name="${base%.gguf}"
     name=$(printf '%s' "$name" | sed -E 's/-00001-of-[0-9]+$//')
-    IFS=$'\t' read -r oname ospec < <(jq -r --arg p "$f" \
-      '.[] | select(.model == $p and (.exclude != true)) | [(.name // ""), (.spec // "")] | @tsv' \
-      "$PRESETS" 2>/dev/null | head -1)
-    label="${oname:-$name}"
-    spec="${ospec:-$(spec_for "$f")}"
-    printf '%s\t%s\t%s\n' "$label" "$f" "$spec"
+    # One row per preset that names this file, not one row per file: two
+    # presets can share one GGUF with different shapes (the 27B serves a 2-slot
+    # gen shape and an 8-slot llm shape from the same file), and keeping only
+    # the first label made the second unselectable from the widget. Safe
+    # because the dropdown's selector is parts[0] -- the preset NAME -- so
+    # duplicated paths never collide, and model.json records .name for the
+    # round-trip. A file no preset claims still gets a bare-filename row.
+    claims=$(jq -r --arg p "$f" \
+      '.[] | select(.model == $p and (.exclude != true))
+       | [(.name // ""), (.spec // "")] | @tsv' "$PRESETS" 2>/dev/null)
+    if [[ -n "$claims" ]]; then
+      while IFS=$'\t' read -r oname ospec; do
+        [[ -n "$oname$ospec" ]] || continue
+        printf '%s\t%s\t%s\n' "${oname:-$name}" "$f" "${ospec:-$(spec_for "$f")}"
+      done <<< "$claims"
+    else
+      printf '%s\t%s\t%s\n' "$name" "$f" "$(spec_for "$f")"
+    fi
   done
   # Presets whose target is not a file here never match the find above, so they
   # would be invisible in the widget's dropdown -- which is exactly the case for
@@ -180,11 +192,14 @@ case "${1:-}" in
     name=$(jq -r --arg n "$sel" '.[] | select(.name == $n) | .name' "$PRESETS" 2>/dev/null | head -1)
     jq -n --arg m "$resolved" --arg s "$spec" --arg n "$name" --arg b "$backend" \
       '{model: $m, spec: $s, backend: $b} + (if $n != "" then {name: $n} else {} end)' > "$MODEL"
-    # SGLang tuning keys live on the preset (context_length, max_total_tokens,
+    # Preset tuning keys (SGLang: context_length, max_total_tokens,
     # max_running_requests, max_mamba_cache_size, mem_fraction_static,
-    # kv_cache_dtype, speculative, rope_parameters) and must survive into
-    # model.json: serve-sglang.sh reads them from THERE, not from presets.
-    # GGUF presets carry none of them, so the merge is a no-op for those.
+    # kv_cache_dtype, speculative, rope_parameters; llama.cpp: n_parallel,
+    # kv_unified_per_slot) must survive into model.json: the launchers read
+    # them from THERE, not from presets. A preset without them keeps the
+    # launcher's own defaults. cardmode.ready_for compares the running
+    # server's /props total_slots against the preset's n_parallel, so these
+    # two keys have to propagate like the SGLang ones do.
     jq --arg n "$sel" -s '
       .[0] as $model | .[1] as $presets
       | ($presets | map(select(.name == $n))[0] // {}) as $p
@@ -192,7 +207,7 @@ case "${1:-}" in
           "context_length", "max_total_tokens", "max_running_requests",
           "max_mamba_cache_size", "mem_fraction_static", "kv_cache_dtype",
           "speculative", "rope_parameters", "ple_offload_embedding",
-          "cuda_graph_max_bs_decode"
+          "cuda_graph_max_bs_decode", "n_parallel", "kv_unified_per_slot"
         ) as $k
         ($model; if $p[$k] != null then .[$k] = $p[$k] else . end)
     ' "$MODEL" "$PRESETS" > "$MODEL.tmp" && mv "$MODEL.tmp" "$MODEL"
