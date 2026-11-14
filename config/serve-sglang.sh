@@ -38,7 +38,14 @@ RUNTIME_FILE="$HOME/.config/llama-server/.sglang_runtime"
 # --- active model: an HF repo id, not a path --------------------------------
 TARGET=""
 [[ -f "$MODEL_CONF" ]] && TARGET=$(jq -r '.model // empty' "$MODEL_CONF" 2>/dev/null || true)
-[[ -n "$TARGET" ]] || TARGET="${SGLANG_DEFAULT_MODEL:-RadixArk/Qwen3.8-Flash-Next-NVFP4}"
+# No built-in default model: a silent fallback to a checkpoint nobody selected
+# costs a full re-download. SGLANG_DEFAULT_MODEL still works; with neither,
+# refuse and say why.
+TARGET="${TARGET:-${SGLANG_DEFAULT_MODEL:-}}"
+if [[ -z "$TARGET" ]]; then
+  echo "serve-sglang: model.json names no model and SGLANG_DEFAULT_MODEL is unset" >&2
+  exit 1
+fi
 # --- full-context profile (one RTX PRO 6000 Blackwell 96 GB) -----------------
 # The cookbook's low-latency cell (bf16 KV, mamba cache 48, 16 request slots)
 # sized the KV pool at 57,216 tokens against a 262,144-token context, so any
