@@ -512,10 +512,11 @@ printf 'mode=%s\n' "$mode"
 # The reconciler's own note: what cardmode did last / is doing (transition,
 # block or abort reason). Cardmode's voice, verbatim.
 printf 'note=%s\n' "$(jq -r '.note // empty' "$CFG/.cardmode.json" 2>/dev/null || true)"
-# TTS: the Chatterbox user unit on the Blackwell (:8880). Its own lifecycle,
-# never a cardmode mode; cardmode only bounces it around sglang's malloc.
+# TTS: the tiny-voca user unit (CPU-only, :8880). Its own lifecycle, never a
+# cardmode mode; it holds no card, so cardmode never bounces it. The old
+# chatterbox.service shares the port; its Conflicts= makes the seat exclusive.
 tts="off"
-[[ "$(systemctl --user is-active chatterbox.service 2>/dev/null || true)" == "active" ]] && tts="on"
+[[ "$(systemctl --user is-active tiny-voca.service 2>/dev/null || true)" == "active" ]] && tts="on"
 printf 'tts=%s\n' "$tts"
 # ComfyUI: the Blackwell CUDA user unit (:8189 behind the :8188 gate). Its
 # own lifecycle like TTS -- cardmode never starts or stops it. Stopping it

@@ -344,7 +344,7 @@ Panel {
           }
         }
 
-        // Chatterbox TTS on the Blackwell (:8880) — its own row because it's
+        // tiny-voca TTS on the CPU (:8880) — its own row because it's
         // a separate service with its own lifecycle, not a llama-server
         // control. Starts in seconds (weights page-cached), first call ~9 s.
         Row {

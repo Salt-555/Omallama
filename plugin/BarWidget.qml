@@ -63,7 +63,7 @@ BarWidget {
   // gate passes prompts through and the idle revert stands down. Toggling
   // never unloads anything — residency stays llama-server's job (Stop).
   property string smart: "off"
-  // Chatterbox TTS on the Blackwell (monitor key "tts"): a separate user
+  // tiny-voca TTS on the CPU (monitor key "tts"): a separate user
   // unit on :8880 with its own lifecycle, independent of llm/gen cardmode.
   property string tts: "off"
   readonly property bool ttsToggleRunning: ttsProc.running
@@ -200,7 +200,7 @@ BarWidget {
   }
 
   // TTS is a plain systemd toggle, not an HTTP flag: it's a separate user
-  // unit (chatterbox.service) that cardmode bounces around the sglang malloc.
+  // unit (tiny-voca.service), CPU-resident, cardmode never touches it.
   // No debounce — systemctl's exit is the result; ttsProc re-polls on exit.
   // ComfyUI is a plain systemd toggle like TTS. No debounce -- systemctl's
   // exit is the result; comfyProc re-polls on exit.
@@ -216,7 +216,7 @@ BarWidget {
     if (ttsProc.running) return
     statusNote = ""
     ttsProc.command = ["systemctl", "--user",
-      root.tts === "on" ? "stop" : "start", "chatterbox.service"]
+      root.tts === "on" ? "stop" : "start", "tiny-voca.service"]
     ttsProc.running = true
   }
 
