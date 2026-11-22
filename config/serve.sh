@@ -29,9 +29,11 @@ MODELCTL="$HOME/.config/omarchy/plugins/salt.llama-server/modelctl.sh"
 # `backend` in model.json always wins over the path rules.
 TARGET=""
 BACKEND=""
+NAME=""
 if [[ -f "$MODEL_CONF" ]]; then
   TARGET=$(jq -r '.model // empty' "$MODEL_CONF" 2>/dev/null || true)
   BACKEND=$(jq -r '.backend // empty' "$MODEL_CONF" 2>/dev/null || true)
+  NAME=$(jq -r '.name // empty' "$MODEL_CONF" 2>/dev/null || true)
 fi
 
 # An explicit backend that takes a non-path target, dispatched before any
@@ -49,7 +51,20 @@ if [[ "${BACKEND,,}" == "basalt" ]]; then
   exec "$HOME/.config/llama-server/serve-basalt.sh"
 fi
 
-[[ -n "$TARGET" && -f "$TARGET" ]] || TARGET="${LLAMA_DEFAULT_MODEL:-$HOME/.lmstudio/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf}"
+# No silent substitution: booting a hardcoded default because the selected
+# file vanished serves a model nobody chose, under the selected preset's
+# widget label, aliasing as ALLMIND so identity checks pass. serve-sglang and
+# serve-basalt already refuse this; so does the plane everywhere else.
+# LLAMA_DEFAULT_MODEL stays an explicit opt-in override, never a guess.
+if [[ -z "$TARGET" || ! -f "$TARGET" ]]; then
+  if [[ -n "${LLAMA_DEFAULT_MODEL:-}" && -f "$LLAMA_DEFAULT_MODEL" ]]; then
+    TARGET="$LLAMA_DEFAULT_MODEL"
+  else
+    echo "serve: selected model file missing: '${TARGET:-<none in model.json>}'" >&2
+    echo "       pick a model in the panel or fix model.json; not booting a default." >&2
+    exit 1
+  fi
+fi
 
 # Gufo-compliant artifacts run on gufo-org's own Strix Halo runtime instead of
 # a llama.cpp build. The backend rule lives in modelctl.sh (resolve-backend);
@@ -57,7 +72,10 @@ fi
 # resolved value from `modelctl.sh set`, recomputed here as a fallback for
 # configs written before the backend field existed.
 if [[ -z "$BACKEND" && -x "$MODELCTL" ]]; then
-  BACKEND=$("$MODELCTL" resolve-backend "$TARGET" "$TARGET" 2>/dev/null || true)
+  # Pass the preset NAME as the selector: a preset that pins "backend" by
+  # name is otherwise invisible to the recompute, and the path rule silently
+  # decides. Falls back to the path for nameless legacy files.
+  BACKEND=$("$MODELCTL" resolve-backend "${NAME:-$TARGET}" "$TARGET" 2>/dev/null || true)
 fi
 if [[ "${BACKEND,,}" == "gufo" ]]; then
   exec "$HOME/.config/llama-server/serve-gufo.sh"

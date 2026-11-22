@@ -96,13 +96,52 @@ jq --arg model "$CONTAINER_PACK" --arg alias "$SERVED_NAME" --argjson port "$POR
         + (if $m.prompt_cache        != null then { "prompt-cache": $m.prompt_cache } else {} end) ),
       server: { port: $port }
     }' "$MODEL_CONF" > "$CFGFILE.tmp"
+# Validate the render BEFORE replacing the previous good config: cardmode
+# reads basalt_config.json as the running pack's identity, so a malformed
+# render must never displace the good file. jq -e exits non-zero here and
+# set -e aborts the boot with the old config intact.
+jq -e . "$CFGFILE.tmp" >/dev/null
 mv "$CFGFILE.tmp" "$CFGFILE"
-jq -e . "$CFGFILE" >/dev/null
 
 # The journal is the only forensic trail for a load: print the shape it will
 # boot with, exactly as written.
 echo "serve-basalt: $CONTAINER from $CONTAINER_PACK on :$PORT"
 sed 's/^/serve-basalt:   /' "$CFGFILE"
+
+# --- card handoff backstop: same contract as serve-sglang.sh ------------------
+# cardmode's gate covers reconciler-driven switches; this covers the MANUAL
+# widget path into the llm shape, which otherwise loads a basalt pack onto a
+# card ComfyUI still holds: starved malloc + Restart=no = dead unit.
+# Which boots are the llm shape? cardmode itself derives the card's mode from
+# the preset NAME in model.json, so use the same name-match. No name (bare
+# path selection) or a nameless modes.json fail toward gating (the card's side).
+CFG_DIR="$HOME/.config/llama-server"
+LLM_PRESET=$(jq -r '.modes.llm.preset // empty' "$CFG_DIR/modes.json" 2>/dev/null || true)
+SEL_NAME=$(jq -r '.name // empty' "$MODEL_CONF" 2>/dev/null || true)
+if [[ -z "$LLM_PRESET" || -z "$SEL_NAME" || "$SEL_NAME" == "$LLM_PRESET" ]]; then
+  COMFY_URL="${COMFY_URL:-http://127.0.0.1:8189}"
+  MIN_FREE_MIB=$(jq -r '.sglang_min_free_mib // 90000' "$CFG_DIR/modes.json" 2>/dev/null || echo 90000)
+  curl -sf --max-time 10 -X POST "$COMFY_URL/free" \
+    -H 'content-type: application/json' \
+    -d '{"unload_models": true, "free_memory": true}' >/dev/null 2>&1 || true
+  for _ in $(seq 1 18); do
+    FREE_MIB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')
+    [[ -z "$FREE_MIB" ]] && break                    # no card/no nvidia-smi: proceed
+    (( FREE_MIB >= MIN_FREE_MIB )) && break
+    echo "serve-basalt: card handoff: free ${FREE_MIB} MiB < ${MIN_FREE_MIB} MiB, waiting" >&2
+    sleep 5
+  done
+else
+  echo "serve-basalt: '$SEL_NAME' is not the llm preset ('$LLM_PRESET'): gen shape, no handoff needed" >&2
+fi
+
+# A stale container from a previous run would hold the port and the card, and
+# the name clash fails the unit with a container name in the journal, not the
+# cause (serve-sglang/serve-gufo pre-clean the same way).
+if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+  echo "serve-basalt: removing leftover container $CONTAINER" >&2
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+fi
 
 exec docker run --rm --init --name "$CONTAINER" \
   --gpus all \

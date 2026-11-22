@@ -35,10 +35,10 @@ TARGET=""
 if [[ -f "$MODEL_CONF" ]]; then
   TARGET=$(jq -r '.model // empty' "$MODEL_CONF" 2>/dev/null || true)
 fi
-[[ -n "$TARGET" && -f "$TARGET" ]] || \
-  TARGET="$MODELS_ROOT/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
-if [[ ! -f "$TARGET" ]]; then
-  echo "target model not found: $TARGET" >&2
+# No silent substitution (same rule serve-sglang/serve-basalt already keep):
+# a missing selection is a loud failure, never a default nobody chose.
+if [[ -z "$TARGET" || ! -f "$TARGET" ]]; then
+  echo "target model not found: '${TARGET:-<none in model.json>}'" >&2
   exit 1
 fi
 
@@ -127,10 +127,9 @@ done
 
 mkdir -p "$CACHE_DIR"
 
-cleanup() {
-  docker stop -t 15 "$CONTAINER" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT INT TERM
+# No EXIT trap: traps cannot run after the `exec docker run` below replaces
+# this shell. The stop contract is the systemd unit's ExecStop, which names
+# gufo-llm. Only the pre-clean belongs here.
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
 exec docker run --rm --init --name "$CONTAINER" --stop-timeout 15 \

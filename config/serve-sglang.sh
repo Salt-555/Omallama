@@ -256,6 +256,12 @@ printf 'backend=sglang\nmodel=%s\nport=%s\nserved=%s\nmax_running_requests=%s\n'
 WATCHDOG_MEM_GIB="${WATCHDOG_MEM_GIB:-3}"
 (
   while :; do
+    # Self-reap: the EXIT trap below can never fire after `exec docker run`
+    # replaces this shell, so the loop ends the moment its container is gone
+    # (previously only systemd's cgroup kill reaped it, which any change to
+    # Restart= would strand as an orphan able to stop containers it doesn't
+    # own).
+    [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" == "true" ]] || exit 0
     avail=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1048576 ))
     if (( avail < WATCHDOG_MEM_GIB )); then
       echo "WATCHDOG: MemAvailable ${avail} GiB < ${WATCHDOG_MEM_GIB} GiB -- stopping $CONTAINER" >&2

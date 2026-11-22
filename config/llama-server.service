@@ -11,10 +11,14 @@ ExecStart=%h/.config/llama-server/serve.sh
 # waits -t 240, then SIGKILLs THE CONTAINER ITSELF and reaps it (--rm cleans
 # up). systemd SIGKILLing the docker run CLI orphans the container instead --
 # on 2026-10-16 it survived holding ~94 GiB and :6969. For the GGUF backends
-# no such container exists and this is a no-op. -t 240 < TimeoutStopSec below.
-ExecStop=/bin/sh -c '/usr/bin/docker stop -t 240 sglang-llm basalt-llm >/dev/null 2>&1 || true'
+# no such container exists and this is a no-op. gufo-llm is named because its
+# serve script's trap cannot fire across its own exec: the unit is its ONLY
+# stop contract. docker stop walks names SERIALLY, but the three containers
+# are mutually exclusive by construction (one :6969 owner), and names that
+# aren't running exit immediately -- realistic worst case is one drain.
+ExecStop=/bin/sh -c '/usr/bin/docker stop -t 240 sglang-llm basalt-llm gufo-llm >/dev/null 2>&1 || true'
 # Backstop above ExecStop's docker wait. sglang's graceful drain of one long
-# streaming reply measured ~5 min; 300 covers the 240 s docker stop + margin.
+# streaming reply measured ~5 min; 300 covers one -t 240 stop + margin.
 TimeoutStopSec=300
 WorkingDirectory=%h/.config/llama-server
 # Restart=no on purpose: a failing model load must not be retried into a
