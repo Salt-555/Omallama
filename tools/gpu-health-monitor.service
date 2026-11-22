@@ -1,0 +1,14 @@
+[Unit]
+Description=GPU health sampler (VRAM/GTT/swap timeline for llama-server crash forensics)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/llama-server/gpu-health-monitor.sh
+Restart=on-failure
+RestartSec=5
+IOSchedulingClass=idle
+CPUWeight=10
+
+[Install]
+WantedBy=default.target
