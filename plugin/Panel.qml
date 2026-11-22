@@ -473,7 +473,10 @@ Panel {
           Button {
             text: s.tts === "on" ? "TTS: on" : "TTS: off"
             leftAlign: true
-            width: (parent.width - parent.spacing) / 2
+            // Same third-of-row width as its siblings: half-the-row made this
+            // row wider than the panel and painted this button past the card
+            // edge (the same pitfall the Comfy comment above records).
+            width: (parent.width - parent.spacing * 2) / 3
             selected: s.tts === "on"
             foreground: root.barForeground
             opacity: enabled ? 1.0 : 0.35
