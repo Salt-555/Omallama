@@ -12,7 +12,7 @@ ExecStart=%h/.config/llama-server/serve.sh
 # up). systemd SIGKILLing the docker run CLI orphans the container instead --
 # on 2026-10-16 it survived holding ~94 GiB and :6969. For the GGUF backends
 # no such container exists and this is a no-op. -t 240 < TimeoutStopSec below.
-ExecStop=/bin/sh -c '/usr/bin/docker stop -t 240 sglang-llm >/dev/null 2>&1 || true'
+ExecStop=/bin/sh -c '/usr/bin/docker stop -t 240 sglang-llm basalt-llm >/dev/null 2>&1 || true'
 # Backstop above ExecStop's docker wait. sglang's graceful drain of one long
 # streaming reply measured ~5 min; 300 covers the 240 s docker stop + margin.
 TimeoutStopSec=300

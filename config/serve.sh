@@ -41,6 +41,14 @@ if [[ "${BACKEND,,}" == "sglang" ]]; then
   exec "$HOME/.config/llama-server/serve-sglang.sh"
 fi
 
+# Basalt takes a .basalt pack path that does exist, but the dispatcher has to
+# choose it BEFORE the GGUF build rules below, which would otherwise claim a
+# Flash-Next-named pack for a llama.cpp build. The pack is read where it lies
+# (see serve-basalt.sh for the /models mount contract).
+if [[ "${BACKEND,,}" == "basalt" ]]; then
+  exec "$HOME/.config/llama-server/serve-basalt.sh"
+fi
+
 [[ -n "$TARGET" && -f "$TARGET" ]] || TARGET="${LLAMA_DEFAULT_MODEL:-$HOME/.lmstudio/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf}"
 
 # Gufo-compliant artifacts run on gufo-org's own Strix Halo runtime instead of

@@ -59,6 +59,9 @@ set -u
 
 BASE="${LLAMA_BASE_URL:-http://127.0.0.1:6969}"
 CFG="${LLAMA_CFG_DIR:-$HOME/.config/llama-server}"
+# Bounded state: the tok/s history keeps at most this many points (a sparkline
+# ring, never a log). The panel reads the last 40 of them.
+HIST_MAX=240
 STATE="$CFG/.pollstate"
 ANCHOR="$CFG/.runanchor"
 LASTTPS="$CFG/.last_tps"
@@ -70,8 +73,12 @@ ENERGY="$CFG/.energy"      # "<joules> <busy_secs> <last_ts> <last_busy> <last_p
 TANCHOR="$CFG/.turnanchor" # counters at the last idle: "<pred> <psec> <prom> <promsec>"
 
 # Which runtime is configured, read once here because the health probe below
-# differs per backend: SGLang answers /health with 200 and an EMPTY body.
+# differs per backend. The probe ITSELF lives in probe.sh: one implementation
+# of health/counts/ready/label shared with cardmode.py's gates.
 cfg_backend=$(jq -r '.backend // empty' "$CFG/model.json" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+PROBE="$HOME/.config/llama-server/probe.sh"
+# shellcheck source=/dev/null
+[[ -f "$PROBE" ]] && source "$PROBE"
 
 # --- GPU power (watts) --------------------------------------------------------
 # Prefer a discrete NVIDIA card when present (nvidia-smi), else the Strix Halo
@@ -107,15 +114,11 @@ fcmp() { awk -v a="$1" -v b="$2" -v op="$3" \
 # During a model load the unit is active while /health is not ok yet; the
 # widget needs both to show "loading" and to keep Stop/Restart reachable.
 st="down"
-if [[ "$cfg_backend" == "sglang" ]]; then
-  # SGLang's /health is 200 with an EMPTY body, so the llama.cpp
-  # `grep -q '"ok"'` test can never match it and the widget would read
-  # "offline" forever. Gate on the status code: 503 while a model loads.
-  _code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "$BASE/health" 2>/dev/null || echo 000)
-  [[ "$_code" == "200" ]] && st="ok"
-elif curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then
-  st="ok"
-fi
+_probe_health=$(probe_health "$cfg_backend" "$BASE" 2>/dev/null || echo down)
+# "loading" is deliberately not ok: a basalt pack that has bound its HTTP
+# server but not loaded reads exactly like a llama.cpp boot before /health
+# answers, and the unit-active branch below renders both as loading.
+[[ "$_probe_health" == "ok" ]] && st="ok"
 # Verbatim unit state, NOT a bool. Collapsing everything that is not "active"
 # into "inactive" erased the one distinction the operator needs: `inactive`
 # means someone pressed Stop (leave it alone), `failed` means something died
@@ -141,8 +144,14 @@ fi
 pwr="$(read_power)"
 
 pred=0; psec=0; ndec=0; proc=0; defer=0; prom=0; promsec=0
+basalt_now=""
 if [[ "$st" == "ok" ]]; then
   metrics=$(curl -sf --max-time 2 "$BASE/metrics" 2>/dev/null)
+  # The request split comes from probe.sh (the same numbers cardmode's drain
+  # check reads); the token counters below stay here because they exist only
+  # for the widget's rate math.
+  _counts=$(probe_counts "$cfg_backend" "$BASE" "${metrics:-}" 2>/dev/null || true)
+  [[ -n "$_counts" ]] && read -r proc defer <<<"$_counts"
   if [[ "$cfg_backend" == "sglang" ]]; then
     # SGLang exposes sglang:* with verbose labels, so match on the family name
     # and take the last field. Values are floats (122.0, 15.198226951000834);
@@ -153,8 +162,6 @@ if [[ "$st" == "ok" ]]; then
     # the tok/s math then divides a near-empty counter. SUM all matching lines.
     pred=$(awk '/^sglang:generation_tokens_total\{/{s+=$NF} END{printf "%.1f", s+0}' <<<"$metrics")
     prom=$(awk '/^sglang:prompt_tokens_total\{/{s+=$NF} END{printf "%.1f", s+0}' <<<"$metrics")
-    proc=$(awk '/^sglang:num_running_reqs\{/{s+=$NF} END{printf "%.0f", s+0}' <<<"$metrics")
-    defer=$(awk '/^sglang:num_queue_reqs\{/{s+=$NF} END{printf "%.0f", s+0}' <<<"$metrics")
     # SGLang publishes no decode-seconds counter (forward_execution_seconds_total
     # is absent from the exposition), so the rate pair is total request latency.
     # pred/psec is therefore tokens per second of REQUEST time, prefill
@@ -176,12 +183,43 @@ if [[ "$st" == "ok" ]]; then
     # the generated-token counter: its rate is tokens/s, which straddles the
     # same 2.0/s line below (generating ~150/s, chunked prefill ~0/s).
     ndec="$pred"
+  elif [[ "$cfg_backend" == "basalt" ]]; then
+    # Basalt publishes ONE JSON document instead of Prometheus text. Its
+    # `totals` object is monotonic across the process (written, decode_ms,
+    # prompt, reused, prompt_ms, since load), so the identical window math
+    # the GGUF backends use applies unchanged -- delta(tokens)/delta(seconds)
+    # on a run boundary. `live.slots` gives the request split, and each entry
+    # in `requests` carries the engine's own measured rate for that request
+    # (the last-run TTFT cell reads the newest one).
+    #
+    # `reused` is the prefix a conversation checkpoint restored: counting it
+    # as prefill work would inflate the encode rate exactly the way sglang's
+    # radix-cache hits did on 2026-10-15 (5.1M device_hit vs ~350k computed),
+    # so prom is prompt MINUS reused. Prompt_ms is the engine's own prompt
+    # time, which is why warm resumes add almost nothing to it.
+    read -r _bw _bdms _bp _br _bpms _bttft _bstate _bnow _bslots < <(jq -r '
+      [ (.totals.written // 0), (.totals.decode_ms // 0), (.totals.prompt // 0),
+        (.totals.reused // 0), (.totals.prompt_ms // 0),
+        ([.requests[]?] | sort_by(.time) | last | .ttft_s // ""),
+        (.live.state // ""), (.live.tok_s // ""),
+        (.live.slots.total // "") ] | @tsv' \
+      <<<"$metrics" 2>/dev/null || true)
+    pred="${_bw:-0}"
+    psec=$(awk -v n="${_bdms:-0}" 'BEGIN{ printf "%.3f", n/1000 }')
+    prom=$(awk -v a="${_bp:-0}" -v b="${_br:-0}" 'BEGIN{ printf "%.1f", (a>b ? a-b : 0) }')
+    promsec=$(awk -v n="${_bpms:-0}" 'BEGIN{ printf "%.3f", n/1000 }')
+    # Same phase trick as sglang: there is no per-iteration decode counter, so
+    # reuse the output-token counter -- its rate is tokens/s and straddles the
+    # 2.0/s line below (generating ~150-400/s, chunked prefill ~0/s).
+    ndec="$pred"
+    basalt_ttft="${_bttft:-}"
+    basalt_state="${_bstate:-}"
+    basalt_now="${_bnow:-}"
+    basalt_slots_total="${_bslots:-}"
   else
     pred=$(awk '/^llamacpp:tokens_predicted_total /{print $2; exit}' <<<"$metrics")
     psec=$(awk '/^llamacpp:tokens_predicted_seconds_total /{print $2; exit}' <<<"$metrics")
     ndec=$(awk '/^llamacpp:n_decode_total /{print $2; exit}' <<<"$metrics")
-    proc=$(awk '/^llamacpp:requests_processing /{print $2; exit}' <<<"$metrics")
-    defer=$(awk '/^llamacpp:requests_deferred /{print $2; exit}' <<<"$metrics")
     prom=$(awk '/^llamacpp:prompt_tokens_total /{print $2; exit}' <<<"$metrics")
     promsec=$(awk '/^llamacpp:prompt_seconds_total /{print $2; exit}' <<<"$metrics")
   fi
@@ -196,6 +234,11 @@ fi
 GUFO=0; SGLANG=0
 if [[ "$cfg_backend" == "sglang" ]]; then
   SGLANG=1
+elif [[ "$cfg_backend" == "basalt" ]]; then
+  :   # Basalt's /metrics is JSON, not Prometheus text: it carries no
+      # llamacpp:/sglang: families to classify, and it must not fall into the
+      # Gufo probe below (which would relabel the backend and read journal
+      # events that will never exist for it).
 elif [[ "$st" == "ok" ]] && ! grep -q '^llamacpp:n_decode_total ' <<<"${metrics:-}"; then
   GUFO=1
 fi
@@ -300,13 +343,17 @@ else
     drate=$(awk -v a="$ndec" -v b="$p_ndec" -v t="$dt" 'BEGIN{ printf "%.3f", (a-b)/t }')
 
     if [[ "$busy" == 1 ]]; then
-      # 2.0 decode-iterations/s separates generating from chunked prefill.
-      # Measured on this server: real generation bursts run 5-21/s (MTP),
-      # prefill chunks ~0.2/s, and request arrival itself ticks once (BOS
-      # decode) — which lands on the encoding side, as it should: the first
-      # chunk has not finished yet. Hysteresis at 1.0/s keeps a genuinely
-      # slow generation from flickering between labels mid-run.
-      if fcmp "$drate" 2.0 ">=" || \
+      if [[ "$cfg_backend" == "basalt" && -n "${basalt_state:-}" ]]; then
+        # Basalt names its own phase, and its token totals only advance at
+        # request COMPLETION -- the rate heuristic below would read a
+        # five-minute generation as flat zeros and label it "encoding".
+        # Trust live.state: generating/thinking/answering are decode phases;
+        # reading/prompt/loading are prefill.
+        case "$basalt_state" in
+          generating|thinking|answering) activity="decoding" ;;
+          *)                             activity="encoding" ;;
+        esac
+      elif fcmp "$drate" 2.0 ">=" || \
          { [[ "$p_phase" == "decoding" ]] && fcmp "$drate" 1.0 ">="; }; then
         activity="decoding"
       else
@@ -327,6 +374,19 @@ else
       awk -v a="$pred" -v b="$a_pred" -v x="$psec" -v y="$a_psec" \
         'BEGIN{ dt=a-b; ds=x-y; if (dt>0 && ds>0.001) printf "%.1f\n", dt/ds }' > "$LASTTPS.tmp"
       if [[ -s "$LASTTPS.tmp" ]]; then mv "$LASTTPS.tmp" "$LASTTPS"; else rm -f "$LASTTPS.tmp"; fi
+      # One history point per run boundary, for the panel's graph. The value is
+      # the same AGGREGATE tok/s the panel shows (all lanes), plus the tokens
+      # it covered; trimmed to a sparkline-sized ring so it never grows into a
+      # log file.
+      if [[ -s "$LASTTPS" ]]; then
+        _hist="$CFG/.tps_history"
+        _dtok=$(awk -v a="$pred" -v b="$a_pred" 'BEGIN{ printf "%.0f", a-b }')
+        printf '%s %s %s\n' "$(date +%s)" "$(cat "$LASTTPS")" "${_dtok:-0}" >> "$_hist"
+        # Cull on every append, not periodically: the file can never exceed
+        # HIST_MAX lines, so a burst of runs (or a year of use) cannot grow it.
+        # tmp+mv keeps a reader from ever seeing a half-written file.
+        tail -n "$HIST_MAX" "$_hist" > "$_hist.tmp" 2>/dev/null && mv "$_hist.tmp" "$_hist"
+      fi
       # Encode (prefill) rate over the same window: prompt tokens / prompt
       # seconds, both completion-batched like the decode counters.
       awk -v a="$prom" -v b="$a_prom" -v x="$promsec" -v y="$a_promsec" \
@@ -340,6 +400,15 @@ else
         _tc=$(awk '/^sglang:time_to_first_token_seconds_count\{/{s+=$NF} END{print s+0}' <<<"${metrics:-}")
         awk -v s="${_ts:-0}" -v c="${_tc:-0}" 'BEGIN{ if (c>0) printf "%.0f\n", 1000*s/c }' > "$LASTTTFT.tmp"
         if [[ -s "$LASTTTFT.tmp" ]]; then mv "$LASTTTFT.tmp" "$LASTTTFT"; else rm -f "$LASTTTFT.tmp"; fi
+      elif [[ "$cfg_backend" == "basalt" ]]; then
+        # Basalt measures TTFT per request; the newest completed one in
+        # `requests` carries it. Empty until something has completed.
+        if [[ -n "${basalt_ttft:-}" ]]; then
+          awk -v t="$basalt_ttft" 'BEGIN{ printf "%.0f\n", t*1000 }' > "$LASTTTFT.tmp"
+          if [[ -s "$LASTTTFT.tmp" ]]; then mv "$LASTTTFT.tmp" "$LASTTTFT"; else rm -f "$LASTTTFT.tmp"; fi
+        else
+          rm -f "$LASTTTFT"
+        fi
       else
         # llama-server /metrics carries no time-to-first-token; leave the panel
         # cell empty rather than inventing one from prefill time.
@@ -422,6 +491,7 @@ backend="${cfg_backend:-llama}"
 if [[ "$st" == "ok" ]]; then
   if [[ "$SGLANG" == 1 ]]; then backend="sglang"
   elif [[ "$GUFO" == 1 ]]; then backend="gufo"
+  elif [[ "$cfg_backend" == "basalt" ]]; then backend="basalt"
   else backend="llama"; fi
 fi
 
@@ -440,7 +510,7 @@ vram=""; vtotal=""
 # the number is needed, because Comfy loads onto that card next.
 nvidia_hosts_llm=""
 if command -v nvidia-smi >/dev/null 2>&1; then
-  if [[ "$cfg_backend" == "sglang" ]]; then
+  if [[ "$cfg_backend" == "sglang" || "$cfg_backend" == "basalt" ]]; then
     nvidia_hosts_llm=1
   else
     _llm_pid=$(systemctl --user show -p MainPID --value llama-server.service 2>/dev/null || true)
@@ -512,6 +582,11 @@ printf 'mode=%s\n' "$mode"
 # The reconciler's own note: what cardmode did last / is doing (transition,
 # block or abort reason). Cardmode's voice, verbatim.
 printf 'note=%s\n' "$(jq -r '.note // empty' "$CFG/.cardmode.json" 2>/dev/null || true)"
+# What cardmode is WAITING ON, as a state: "waiting: drain 2 in flight before
+# llm -> gen", "waiting: card handoff (71000/90000 needed)", "loading llm",
+# "waiting: dwell 43s ...". Empty = nothing pending. Waits have no deadline --
+# this key is how the panel shows one instead of it looking like a hang.
+printf 'phase=%s\n' "$(jq -r '.phase // empty' "$CFG/.cardmode.json" 2>/dev/null || true)"
 # TTS: the tiny-voca user unit (CPU-only, :8880). Its own lifecycle, never a
 # cardmode mode; it holds no card, so cardmode never bounces it. The old
 # chatterbox.service shares the port; its Conflicts= makes the seat exclusive.
@@ -527,14 +602,34 @@ printf 'comfy=%s\n' "$comfy"
 printf 'activity=%s\n' "$activity"
 printf 'req_active=%s\n' "$proc"
 printf 'req_deferred=%s\n' "$defer"
+# Slots: used / total, the concurrency the engine was booted for. Total comes
+# from the runtime when it reports one (basalt /metrics live.slots.total, which
+# is what the engine actually built); otherwise from the config it booted with
+# (model.json parallel, or a sglang preset's n_parallel). Used is the same
+# count req_active carries, so the two can never disagree.
+slots_total="${basalt_slots_total:-}"
+if [[ -z "$slots_total" ]]; then
+  slots_total=$(jq -r '.parallel // .n_parallel // empty' "$CFG/model.json" 2>/dev/null || true)
+fi
+printf 'slots_used=%s\n' "$proc"
+printf 'slots_total=%s\n' "$slots_total"
 # Always emitted, empty when there is no completed run to report, so the widget
 # has a single rule for "no value": absent means clear it.
 printf 'tps_last=%s\n' "$last"
 printf 'tps_enc=%s\n' "$(cat "$LASTENC" 2>/dev/null || true)"
 printf 'ttft=%s\n' "$(cat "$LASTTTFT" 2>/dev/null || true)"
+# Instantaneous rate, when the runtime reports one (basalt's live.tok_s).
+# Runtimes whose counters only advance at completion leave this empty, and the
+# bar face falls back to the phase word -- the display decides, the probe does
+# not invent a number.
+printf 'tps_now=%s\n' "${basalt_now:-}"
 printf 'model=%s\n' "$model"
 printf 'name=%s\n' "$name"
 printf 'backend=%s\n' "$backend"
+# Display name for the runtime, named ONCE here: the QML must not carry a
+# second copy of the backend->label map (it drifted, and the panel header
+# showed "llama.cpp" over a serving Basalt).
+printf 'backend_label=%s\n' "$(probe_label "$backend" 2>/dev/null || echo "llama.cpp")"
 printf 'vram=%s\n' "${vram:-0}"
 printf 'vram_total=%s\n' "${vtotal:-0}"
 printf 'power_w=%s\n' "${pwr:-}"

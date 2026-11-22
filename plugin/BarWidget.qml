@@ -23,13 +23,12 @@ BarWidget {
   // counters only advance at request completion, so phase cannot come from
   // them). See monitor.sh's header for the measured numbers behind this.
   property string activity: "idle"
-  property string backend: "llama"          // runtime serving: llama | gufo | sglang
-  // Display name for whichever runtime the monitor reports, used by the bar
-  // tooltip and the panel header. Kept next to `backend` so a new backend
-  // only has to be named once.
-  readonly property string backendLabel: backend === "gufo" ? "Gufo"
-    : backend === "sglang" ? "SGLang"
-    : "llama.cpp"
+  property string backend: "llama"          // runtime serving: llama | gufo | sglang | basalt
+  // Display name for whichever runtime the monitor reports. Fed by
+  // monitor.sh (probe.sh's label table), NOT mapped here: a second copy of the
+  // table in QML is what printed "llama.cpp" over a serving Basalt, and a
+  // loaded widget never hot-reloads the fix.
+  property string backendLabel: "llama.cpp"
   property string tpsEnc: ""               // last run: encode (prefill) t/s
   property string ttftMs: ""               // last run: time to first token, ms
   property string reqActive: "0"           // requests on a session right now
@@ -39,6 +38,7 @@ BarWidget {
   property real vramUsed: 0             // bytes
   property real vramTotal: 0            // bytes
   property string tpsLast: ""           // tok/s of the last completed run
+  property string tpsNow: ""            // instantaneous tok/s, when the runtime reports one
   property string powerW: ""            // instantaneous GPU power, watts
   property string avgW: ""              // avg watts over the last completed turn
   property string tokW: ""              // tokens/joule over the last completed turn
@@ -81,6 +81,11 @@ BarWidget {
   property string resident: ""             // sglang container running: "true"/"false"
   property string cardmodeSwitching: "false"
   property string cardmodeNote: ""
+  // What cardmode is waiting on right now (see monitor.sh phase=). A wait is
+  // a state, not a deadline: the panel shows "waiting: drain 2 in flight",
+  // "waiting: card handoff (71000/90000 needed)" or "loading llm" while the
+  // reconciler holds, and nothing anywhere times out of it.
+  property string cardmodePhase: ""
   // Which resident shape owns the card right now: llm | gen | "" (no mode
   // preset loaded = a hand-picked model). Derived in monitor.sh from
   // model.json + modes.json, exactly like cardmode derives it.
@@ -109,6 +114,8 @@ BarWidget {
   // can say why instead of pinning "Switching model…" forever.
   property string statusNote: ""
   property string controlAction: ""
+  property string slotsUsed: ""         // slots busy / slots the engine has
+  property string slotsTotal: ""
   readonly property int switchTimeoutMs: 180000
 
   // Theme-driven state colors, matching the first-party pattern
@@ -162,6 +169,9 @@ BarWidget {
     // deliberate stop (✕) is fine to ignore, a crash (⚠) needs a Start, and a
     // load in flight (…) needs patience.
     if (status === "down") return serviceFailed ? "llm ⚠" : serviceActive ? "llm …" : "llm ✕"
+    // Busy: the phase word alone. A live rate does not fit this bar column --
+    // "DEC 330" rendered clipped to its first digit -- so the number lives in
+    // the tooltip and the panel, where there is room for it.
     if (activity !== "idle") return phaseGlyph
     if (tpsLast !== "") return tpsLast + " t/s"
     return "llm"
@@ -194,7 +204,7 @@ BarWidget {
     if (target === root.mode) return
     root.modeTarget = target
     root.statusNote = ""
-    modeSwitchProc.command = ["curl", "-sS", "--max-time", "900",
+    modeSwitchProc.command = ["curl", "-sS",
       "http://127.0.0.1:8190/switch?mode=" + target]
     modeSwitchProc.running = true
   }
@@ -324,6 +334,8 @@ BarWidget {
         }
         else if (k === "activity") root.activity = v
         else if (k === "backend") root.backend = v
+        else if (k === "backend_label") root.backendLabel = v
+        else if (k === "tps_now") root.tpsNow = v
         else if (k === "tps_last") root.tpsLast = v
         else if (k === "tps_enc") root.tpsEnc = v
         else if (k === "ttft") root.ttftMs = v
@@ -331,6 +343,8 @@ BarWidget {
         else if (k === "avg_w") root.avgW = v
         else if (k === "tok_w") root.tokW = v
         else if (k === "req_active") root.reqActive = v
+        else if (k === "slots_used") root.slotsUsed = v
+        else if (k === "slots_total") root.slotsTotal = v
         else if (k === "req_deferred") root.reqDeferred = v
         else if (k === "model") { root.model = v; root.currentModel = v }
         else if (k === "name") root.modelName = v
@@ -346,6 +360,7 @@ BarWidget {
         else if (k === "resident") root.resident = v
         else if (k === "switching") root.cardmodeSwitching = v
         else if (k === "note") root.cardmodeNote = v
+        else if (k === "phase") root.cardmodePhase = v
       }
     }
   }
@@ -426,9 +441,10 @@ BarWidget {
 
   Process {
     id: modeSwitchProc
-    // cardmode answers "ok: ..." (200) or "failed: ..." (503) as the body, so
-    // the reply text IS the result -- no status parsing needed, and a refusal
-    // ("llm still busy after 600s") lands in statusNote verbatim.
+    // No --max-time: cardmode's waits (drain, card handoff, load) have no
+    // deadline, so the caller must not invent one. The live wait arrives via
+    // the poll as phase= and the panel renders it while this call is still
+    // outstanding; the reply text ("ok: ..." / "failed: ...") is the result.
     stdout: StdioCollector { id: modeOut; waitForEnd: true }
     onExited: function(code) {
       var out = String((modeOut.text || "")).trim()
@@ -481,6 +497,12 @@ BarWidget {
     text: root.barText
     dimmed: root.status !== "ok"
     tooltipText: root.modeLabel + " · " + root.backendLabel + " · " + root.activityLabel
+      + (root.activity !== "idle" && root.tpsNow !== ""
+         ? " · " + Math.round(Number(root.tpsNow)) + " tok/s live"
+         : "")
+      + (root.slotsTotal !== ""
+         ? " · " + (root.slotsUsed !== "" ? root.slotsUsed : "0") + "/" + root.slotsTotal + " slots"
+         : "")
       + (root.model ? " · " + root.shortModel(root.model) : "")
       + (root.powerText ? " · " + root.powerText : "")
       + (root.tokWText ? " · " + root.tokWText : "")

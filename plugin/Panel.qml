@@ -16,12 +16,22 @@ Panel {
   property var hostWidget: null
   readonly property var s: hostWidget || root
 
-  function open() { root.controller.show() }
+  function open() { root.controller.show(); root.loadHistory() }
+  onVisibleChanged: if (visible) root.loadHistory()
   function close() { root.controller.hide() }
   function switchPanel(direction) {
     if (root.bar && typeof root.bar.switchPanelFrom === "function")
       return root.bar.switchPanelFrom(root.hostWidget || root, direction)
     return false
+  }
+
+  // ---- tok/s history (panel graph) ----------------------------------------
+  // monitor.sh appends one line per completed run; this is a sparkline source.
+  property var tpsHistory: []
+  function loadHistory() {
+    // Never stack a second tail on top of one still running: a slow disk or a
+    // paused compositor would otherwise queue processes behind the 5 s timer.
+    if (!historyProc.running) historyProc.running = true
   }
 
   // ---- cardmode config (gear icon, bottom-right) ---------------------------
@@ -123,23 +133,14 @@ Panel {
           }
           Text {
             id: titleText
-            text: (s.backend === "gufo" ? "Gufo"
-                   : s.backend === "sglang" ? "SGLang"
-                   : "llama.cpp")
+            // The card's job is the headline (Chat / Images / Manual); the
+            // RUNTIME it happens to run on is a detail, and it lives on the
+            // status line. This used to print the backend name, which is how a
+            // backend the local map had never heard of read as "llama.cpp".
+            text: s.modeLabel || "—"
             color: root.barForeground
             font.family: Style.font.family
             font.pixelSize: Style.font.subtitle
-            font.bold: true
-          }
-          Text {
-            id: modeText
-            // The card's job, in the user's words (Chat / Images / Manual).
-            text: s.modeLabel || ""
-            anchors.verticalCenter: parent.verticalCenter
-            color: root.barForeground
-            opacity: 0.85
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
             font.bold: true
           }
           Text {
@@ -147,21 +148,23 @@ Panel {
             // activityLabel first: phaseWord is always defined on the host
             // ("idle"), so reading it first pinned this to "idle" even when the
             // dot went urgent for loading/offline/draining.
-            text: s.activityLabel || s.phaseWord || "…"
+            text: (s.activityLabel || s.phaseWord || "…")
+                  + (s.slotsTotal !== ""
+                     ? " · " + (s.slotsUsed !== "" ? s.slotsUsed : "0") + "/" + s.slotsTotal
+                     : "")
             anchors.verticalCenter: parent.verticalCenter
             color: s.statusColor || root.barForeground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
           }
           // Config gear, parked right. Row has no fillWidth, so the spacer is
-          // computed from the other items' widths (six items, five gaps).
+          // computed from the other items' widths (four items, four gaps).
           Item {
             width: Math.max(0, parent.width - statusDot.width
                                   - titleText.implicitWidth
-                                  - modeText.implicitWidth
                                   - actText.implicitWidth
                                   - gearBox.width
-                                  - parent.spacing * 5)
+                                  - parent.spacing * 4)
             height: 1
           }
           Rectangle {
@@ -171,7 +174,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             radius: Math.min(4, Style.cornerRadius)
             color: gearArea.containsMouse
-                   ? Style.hoverFillFor(root.barForeground, Commons.Color.accent)
+                   ? Style.hoverFillFor(root.barForeground, Color.accent)
                    : "transparent"
 
             Text {
@@ -231,16 +234,32 @@ Panel {
         Column {
           width: parent.width
           spacing: Style.space(4)
-          Text {
+          // Rates take the width they can; the runtime tag is pinned right so
+          // it never gets elided. As the tail of the elided line it read
+          // "· Bas…" on any panel narrower than the text.
+          Row {
             width: parent.width
-            elide: Text.ElideRight
-            text: (s.tpsLast !== "" ? "dec " + s.tpsLast : "dec —")
-                  + " · " + (s.tpsEnc !== "" ? "enc " + s.tpsEnc : "enc —")
-                  + " t/s · " + (s.vramText || "VRAM —")
-            color: root.barForeground
-            opacity: 0.7
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
+            spacing: Style.space(6)
+            Text {
+              width: Math.max(0, parent.width - backendTag.implicitWidth - parent.spacing)
+              elide: Text.ElideRight
+              text: (s.tpsLast !== "" ? "dec " + s.tpsLast : "dec —")
+                    + " · " + (s.tpsEnc !== "" ? "enc " + s.tpsEnc : "enc —")
+                    + " t/s · " + (s.vramText || "VRAM —")
+              color: root.barForeground
+              opacity: 0.7
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              id: backendTag
+              // The runtime, named by monitor.sh from probe.sh's label table.
+              text: s.backendLabel || ""
+              color: root.barForeground
+              opacity: 0.45
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+            }
           }
           Text {
             // Deferred requests (queue backed up) and TTFT (only meaningful
@@ -256,6 +275,74 @@ Panel {
             opacity: 0.7
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
+          }
+        }
+
+        // ---- tok/s per completed run ---------------------------------------
+        // One bar per run, written by monitor.sh at every run boundary. These
+        // are the AGGREGATE numbers (all lanes), same as the line above, so the
+        // shape answers "what did the card actually do", request by request.
+        Item {
+          id: histChart
+          width: parent.width
+          height: histCaption.height + Style.space(5) + histRow.height
+          visible: root.tpsHistory.length > 0
+
+          readonly property int capacity: 40
+          readonly property real peak: {
+            var m = 0
+            for (var i = 0; i < root.tpsHistory.length; i++)
+              m = Math.max(m, root.tpsHistory[i])
+            return Math.max(m, 1)
+          }
+          // Bar width depends on CAPACITY, never on how many points exist yet.
+          // Sizing it off the point count made every bar shrink each time a run
+          // finished, so the whole row twitched under the cursor.
+          readonly property real barW: Math.max(1, (width - (capacity - 1) * histRow.spacing) / capacity)
+
+          Text {
+            id: histCaption
+            width: parent.width
+            elide: Text.ElideRight
+            text: "tok/s per run · peak " + Math.round(histChart.peak)
+                  + (root.tpsHistory.length
+                     ? " · last " + Math.round(root.tpsHistory[root.tpsHistory.length - 1]) : "")
+            color: root.barForeground
+            opacity: 0.55
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Row {
+            id: histRow
+            anchors.top: histCaption.bottom
+            anchors.topMargin: Style.space(5)
+            // Right-anchored: new runs enter at the right edge and old ones
+            // slide left, the way a scrolling sparkline reads. Width follows
+            // the point count but the bars themselves never change size.
+            anchors.right: parent.right
+            width: Math.min(parent.width,
+                            root.tpsHistory.length * histChart.barW
+                            + Math.max(root.tpsHistory.length - 1, 0) * spacing)
+            height: 24
+            spacing: 1
+
+            Repeater {
+              model: root.tpsHistory
+              Item {
+                width: histChart.barW
+                height: histRow.height
+                Rectangle {
+                  width: parent.width
+                  height: Math.max(1, Math.round(parent.height * (modelData / histChart.peak)))
+                  anchors.bottom: parent.bottom
+                  radius: Math.min(1, width / 3)
+                  color: root.barForeground
+                  // The newest run is the one the numbers above describe.
+                  opacity: index === root.tpsHistory.length - 1 ? 0.9 : 0.4
+                }
+              }
+            }
           }
         }
 
@@ -277,6 +364,7 @@ Panel {
         // jumped between states and two could compete for attention.
         Text {
           readonly property bool cardmodeTalking: (s.cardmodeSwitching === "true") || s.modeSwitchRunning
+                   || String(s.cardmodePhase || "") !== ""
                    || /blocked|aborted|failed|unloaded|timed out/.test(String(s.cardmodeNote || ""))
           readonly property string note: s.serviceFailed === true
               ? "llama-server died (" + (s.serviceExit || "?") + ") — nothing restarts it, press Start"
@@ -284,6 +372,9 @@ Panel {
               : s.modelSwitching
               ? "Reloading " + (s.currentModel ? String(s.currentModel).split("/").pop() : "…")
               : s.controlRunning ? "Working…"
+              // cardmode's live WAIT wins over its last note: "waiting: drain 2
+              // in flight" is what is true right now, the note is history.
+              : String(s.cardmodePhase || "") !== "" ? s.cardmodePhase
               : cardmodeTalking
               ? (s.cardmodeNote || (s.modeSwitchRunning ? "asking cardmode to switch…" : ""))
               : ""
@@ -346,7 +437,7 @@ Panel {
 
         // tiny-voca TTS on the CPU (:8880) — its own row because it's
         // a separate service with its own lifecycle, not a llama-server
-        // control. Starts in seconds (weights page-cached), first call ~9 s.
+        // control. 18 MB CPU model: starts instantly, always resident.
         Row {
           width: parent.width
           spacing: Style.spacing.controlGap
@@ -433,7 +524,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             radius: Math.min(4, Style.cornerRadius)
             color: configCloseArea.containsMouse
-                   ? Style.hoverFillFor(root.barForeground, Commons.Color.accent)
+                   ? Style.hoverFillFor(root.barForeground, Color.accent)
                    : "transparent"
 
             Text {
@@ -527,6 +618,37 @@ Panel {
   }
 
   // ---- config processes -----------------------------------------------------
+  // Sparkline source: monitor.sh appends "epoch tps tokens" per completed run.
+  // Tail is capped at 40 points, matching the chart's fixed capacity.
+  Process {
+    id: historyProc
+    command: ["sh", "-c", "tail -n 40 \"$HOME/.config/llama-server/.tps_history\" 2>/dev/null || true"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var out = []
+        var lines = String(text || "").split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          var f = lines[i].trim().split(/\s+/)
+          if (f.length >= 2) {
+            var v = parseFloat(f[1])
+            if (isFinite(v) && v > 0) out.push(v)
+          }
+        }
+        root.tpsHistory = out.slice(-40)
+      }
+    }
+  }
+
+  // Refresh while the panel is open, so a run finishing behind it appears
+  // without closing and reopening.
+  Timer {
+    interval: 5000
+    repeat: true
+    running: root.visible
+    onTriggered: root.loadHistory()
+  }
+
   Process {
     id: configShowProc
     command: ["bash", s.pluginDir + "/modesctl.sh", "show"]

@@ -65,14 +65,16 @@ resolve_spec() {
   spec_for "$sel"
 }
 
-# backend_for <model-path> -> gufo|llama. SGLang is never reached here: it is
-# always chosen by an explicit preset "backend", since its target is a repo id
-# rather than a path. Gufo runs gufo-org's curated
-# artifacts on their own Strix Halo runtime; every other quant/fork stays on
-# a llama.cpp build. Keep this list in sync with gufo's docs/models table.
+# backend_for <model-path> -> gufo|llama|basalt. SGLang is never reached here:
+# it is always chosen by an explicit preset "backend", since its target is a
+# repo id rather than a path. Gufo runs gufo-org's curated
+# artifacts on their own Strix Halo runtime; a .basalt pack runs the Basalt
+# engine; every other quant/fork stays on a llama.cpp build. Keep this list in
+# sync with gufo's docs/models table.
 backend_for() {
   local p="${1,,}"
   case "$p" in
+    *.basalt)                                      echo "basalt" ;;
     *unsloth/qwen3.8-flash-next-gguf/ud-q4_k_xl/*) echo "gufo" ;;
     *unsloth/qwen3.8-27b-gguf/ud-*)                echo "gufo" ;;
     */antirez/deepseek-v4-gguf/*)                  echo "gufo" ;;
@@ -80,15 +82,15 @@ backend_for() {
   esac
 }
 
-# resolve_backend <name|path> [<resolved-path>] -> gufo|llama|sglang. The
-# preset's explicit "backend" wins; else the path rule from backend_for.
+# resolve_backend <name|path> [<resolved-path>] -> gufo|llama|sglang|basalt.
+# The preset's explicit "backend" wins; else the path rule from backend_for.
 resolve_backend() {
   local sel="${1:-}" path="${2:-${1:-}}" ov=""
   ov=$(jq -r --arg n "$sel" --arg p "$path" \
     '.[] | select(.exclude != true and (.name == $n or .model == $n or .model == $p)) | (.backend // "")' \
     "$PRESETS" 2>/dev/null | head -1 | tr '[:upper:]' '[:lower:]')
   case "$ov" in
-    gufo|llama|sglang) echo "$ov"; return ;;
+    gufo|llama|sglang|basalt) echo "$ov"; return ;;
   esac
   backend_for "$path"
 }
@@ -99,8 +101,11 @@ is_excluded() {
 }
 
 # discover_models -> name<TAB>path<TAB>spec per servable model on disk
+# (.basalt packs are discovered too: a Basalt preset must be selectable from
+# the widget, and backend_for routes a bare pack to the Basalt engine by
+# extension, never to a llama.cpp build).
 discover_models() {
-  find "$DISCOVER_ROOT" -name '*.gguf' -type f 2>/dev/null | sort | while read -r f; do
+  find "$DISCOVER_ROOT" -type f \( -name '*.gguf' -o -name '*.basalt' \) 2>/dev/null | sort | while read -r f; do
     base="${f##*/}"
     case "$base" in
       mmproj-*|*-draft.gguf|mtp-*) continue ;;
@@ -137,7 +142,11 @@ discover_models() {
          | [ (.name // ""), .model, (.spec // "") ] | @tsv' "$PRESETS" 2>/dev/null \
   | while IFS=$'\t' read -r l m sp; do
       [[ -n "$l" && -n "$m" ]] || continue
-      [[ -f "$m" ]] && continue        # a real file: already listed above
+      # A real file UNDER THE DISCOVERY ROOT was already emitted by the find
+      # above. Anything else is reachable only from its preset: SGLang's repo
+      # id, and a .basalt pack outside the root (ours lives in
+      # ~/egpu-nvidia-setup/basalt/models, which the find never walks).
+      [[ -f "$m" && "$m" == "$DISCOVER_ROOT"/* ]] && continue
       printf '%s\t%s\t%s\n' "$l" "$m" "${sp:-}"
     done
 }
@@ -200,16 +209,19 @@ case "${1:-}" in
     # launcher's own defaults. cardmode.ready_for compares the running
     # server's /props total_slots against the preset's n_parallel, so these
     # two keys have to propagate like the SGLang ones do.
+    # Every preset key rides along EXCEPT the control keys (name, model,
+    # backend, exclude) and the llama.cpp drafter kind, which resolve_spec
+    # derives. This used to be a whitelist of 19 names, and a knob nobody
+    # remembered to add was dropped SILENTLY: the launcher reads model.json,
+    # so the only symptom was a flag that never took effect.
     jq --arg n "$sel" -s '
       .[0] as $model | .[1] as $presets
       | ($presets | map(select(.name == $n))[0] // {}) as $p
-      | reduce (
-          "context_length", "max_total_tokens", "max_running_requests",
-          "max_mamba_cache_size", "mem_fraction_static", "kv_cache_dtype",
-          "speculative", "rope_parameters", "ple_offload_embedding",
-          "cuda_graph_max_bs_decode", "n_parallel", "kv_unified_per_slot"
-        ) as $k
-        ($model; if $p[$k] != null then .[$k] = $p[$k] else . end)
+      | reduce ($p | keys_unsorted[]) as $k
+        ($model;
+         if ($k == "name" or $k == "model" or $k == "backend"
+             or $k == "exclude" or $k == "spec")
+         then . else .[$k] = $p[$k] end)
     ' "$MODEL" "$PRESETS" > "$MODEL.tmp" && mv "$MODEL.tmp" "$MODEL"
     echo "$resolved"
     ;;

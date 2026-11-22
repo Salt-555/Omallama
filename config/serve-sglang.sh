@@ -28,7 +28,7 @@ set -euo pipefail
 
 MODEL_CONF="$HOME/.config/llama-server/model.json"
 HF_CACHE_DIR="${SGLANG_HF_CACHE:-$HOME/.cache/huggingface}"
-IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:dev-qwen38-next-local}"
+# IMAGE is resolved below, after TARGET: it is a per-preset key (sglang_image).
 CONTAINER="sglang-llm"
 PORT="${SGLANG_PORT:-6969}"
 SERVED_NAME="${SGLANG_SERVED_NAME:-ALLMIND}"
@@ -38,9 +38,10 @@ RUNTIME_FILE="$HOME/.config/llama-server/.sglang_runtime"
 # --- active model: an HF repo id, not a path --------------------------------
 TARGET=""
 [[ -f "$MODEL_CONF" ]] && TARGET=$(jq -r '.model // empty' "$MODEL_CONF" 2>/dev/null || true)
-# No built-in default model: a silent fallback to a checkpoint nobody selected
-# costs a full re-download. SGLANG_DEFAULT_MODEL still works; with neither,
-# refuse and say why.
+# No built-in default model. The Flash-Next NVFP4 checkpoint this default used
+# to name was deleted from the cache, and a silent fallback to a checkpoint
+# nobody selected costs a re-download of the whole thing. The env override
+# still works; with neither, refuse and say why.
 TARGET="${TARGET:-${SGLANG_DEFAULT_MODEL:-}}"
 if [[ -z "$TARGET" ]]; then
   echo "serve-sglang: model.json names no model and SGLANG_DEFAULT_MODEL is unset" >&2
@@ -67,6 +68,99 @@ if [[ -z "$PLE" ]]; then
 fi
 PLE_FLAGS=()
 [[ "$PLE" == "true" ]] && PLE_FLAGS=(--ple-offload-embedding)
+
+# --- model family: Flash-Next (default) vs Inkling/looped-TML ----------------
+# Everything below that says "this checkpoint's recipe" branches here. The
+# Flash-Next shape stays the fall-through default; an Inkling-family target
+# (the fixed-loop checkpoint or the TML variable-loop research twin) switches
+# the whole flag set to the SGLang cookbook's VERIFIED RTX PRO 6000 cell
+# (docs.sglang.io/cookbook/autoregressive/ThinkingMachines/Inkling-2-Mini):
+# TP1/EP1, FA4 attention, default BF16 GEMM, page-size 128, and NO
+# --quantization flag — the checkpoint carries its own hf_quant_config
+# (NVFP4 experts layers 0-19, MXFP8 layers 20-23) and the recipe lets sglang
+# read it. The Flash-Next cell's mamba/linear-attn/QSA flags are
+# Qwen4-Exp-shaped and must not ride along, and the two overlay bind mounts
+# below are file-pinned to the dev-qwen38-next-local build — mounting them
+# over the inkling-2-mini image risks a stale-file API mismatch, so they are
+# gated to the Flash-Next family too.
+INKLING=false
+case "$TARGET" in *Inkling*|*inkling*|*TML-d24*) INKLING=true ;; esac
+
+# Container image: per-preset key, like basalt_image. Declared in EVERY sglang
+# preset on purpose — modelctl's merge is set-only, so a preset that omits the
+# key would inherit the PREVIOUS model's image from a stale model.json.
+IMAGE=$(jq -r '.sglang_image // empty' "$MODEL_CONF" 2>/dev/null || echo "")
+IMAGE="${IMAGE:-${SGLANG_IMAGE:-lmsysorg/sglang:dev-qwen38-next-local}}"
+
+if $INKLING; then
+  KVDTYPE=$(jq -r '.kv_cache_dtype // "auto"' "$MODEL_CONF" 2>/dev/null || echo auto)
+  PAGE_SIZE=128
+  QUANT_FLAGS=()
+  FAMILY_FLAGS=(--ep 1 --attention-backend fa4 --dtype bfloat16 --grammar-backend xgrammar)
+  FLASH_FLAGS=()
+  PARSER_FLAGS=(--reasoning-parser inkling --tool-call-parser inkling2)
+  OVERLAY_FLAGS=()
+  MM_FAMILY_FLAGS=(--enable-multimodal)
+  SPEC_ENV=()
+else
+  KVDTYPE=$(jq -r '.kv_cache_dtype // "fp8_e4m3"' "$MODEL_CONF" 2>/dev/null || echo fp8_e4m3)
+  PAGE_SIZE=64
+  QUANT_FLAGS=(--quantization modelopt_fp4 --fp4-gemm-backend flashinfer_cutlass --moe-runner-backend flashinfer_cutlass)
+  FAMILY_FLAGS=(--mamba-track-interval 64 --linear-attn-prefill-backend triton --linear-attn-decode-backend flashinfer --mamba-radix-cache-strategy extra_buffer --mamba-ssm-dtype bfloat16)
+  FLASH_FLAGS=(--mm-feature-transport "${MM_TRANSPORT:-cuda_ipc}")
+  PARSER_FLAGS=(--reasoning-parser qwen3 --tool-call-parser qwen3_coder)
+  MM_FAMILY_FLAGS=()
+  # Feature transport. Unset means "cpu": every image feature round-trips
+  # through host RAM per prefill chunk over the caching pinned allocator. That
+  # async D2H copy is what raised "CUDA error: invalid argument" twice
+  # (2026-10-16 17:43, 2026-10-19 14:18) and killed the scheduler.
+  # "cuda_ipc" keeps features in a bounded device-resident pool
+  # (SGLANG_MM_FEATURE_CACHE_MB, default 1024 MiB) and falls back to CPU when
+  # the pool is full. Documented in server_args.py:2879 / `sglang serve --help`.
+  # MM_TRANSPORT=cpu reverts to the old behaviour without editing this file.
+  FLASH_FLAGS=(--mm-feature-transport "${MM_TRANSPORT:-cuda_ipc}")
+  # The two file-pinned overlays (see the exec line comment): QSA fp8 tile
+  # dequant fix + mm feature-offload guard, both authored against
+  # dev-qwen38-next-local.
+  OVERLAY_FLAGS=(
+    -v "$HOME/egpu-nvidia-setup/sglang/qsa-fp8-overlay/python/sglang/srt/layers/attention/qsa/sparse_attn.py:/sgl-workspace/sglang/python/sglang/srt/layers/attention/qsa/sparse_attn.py:ro"
+    -v "$HOME/egpu-nvidia-setup/sglang/mm-offload-overlay/python/sglang/srt/managers/mm_utils.py:/sgl-workspace/sglang/python/sglang/srt/managers/mm_utils.py:ro"
+  )
+  # Speculative (NEXTN/MTP) decoding: on unless the preset disables it. The
+  # YaRN long-context preset turns it off -- draft acceptance collapses past
+  # ~131k (observed on gufo with this model family), and rejected drafts cost
+  # 4x verify compute at deep positions, making decode SLOWER than pure AR.
+  # NB: '.speculative // true' would be WRONG here -- jq's // treats false as
+  # empty and would silently re-enable it.
+  if [[ "$(jq -r 'if .speculative == null then true else .speculative end' "$MODEL_CONF" 2>/dev/null || echo true)" == "true" ]]; then
+    SPEC_FLAGS=(--speculative-algorithm NEXTN --speculative-num-steps 3
+                --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+                --speculative-use-rejection-sampling)
+  else
+    SPEC_FLAGS=()
+  fi
+fi
+if $INKLING && [[ "$(jq -r 'if .speculative == null then true else .speculative end' "$MODEL_CONF" 2>/dev/null || echo true)" == "true" ]]; then
+  # DSpark on the bundled MTP draft head; the verified rtx6000 cell uses 8
+  # draft tokens and four SGLANG_OPT_* speculative optimizations.
+  SPEC_FLAGS=(--speculative-algorithm DSPARK --speculative-num-draft-tokens 8)
+  SPEC_ENV=(--env SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL=1
+            --env SGLANG_OPT_DSV41_DSPARK_MID_FOLD=1
+            --env SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE=1
+            --env SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS=1)
+else
+  if $INKLING; then SPEC_FLAGS=(); fi   # speculative off for inkling
+  SPEC_ENV=()
+fi
+# trust_remote_code: sglang defaults it OFF (server_args trust_remote_code=False)
+# and the launcher never passed it. Ripple ships its own modeling code (a novel
+# architecture), so it needs the flag to load. The flag is an arbitrary
+# code-execution grant to the HF repo, so it is scoped PER-PRESET here: only a
+# preset with "trust_remote_code": true sets it; every other model (Ornith,
+# Flash-Next, ...) reads false and stays off it.
+TRUST=$(jq -r '.trust_remote_code // false' "$MODEL_CONF" 2>/dev/null || echo false)
+TRUST_FLAGS=()
+[[ "$TRUST" == "true" ]] && TRUST_FLAGS=(--trust-remote-code)
 [[ -n "$CGRAPH" ]] || CGRAPH="$MAXRUN"
 MEMFRAC=$(jq -r '.mem_fraction_static // 0.98' "$MODEL_CONF" 2>/dev/null || echo 0.98)
 CTX=$(jq -r '.context_length // 262144' "$MODEL_CONF" 2>/dev/null || echo 262144)
@@ -86,11 +180,12 @@ TOTALTOK=$(jq -r '.max_total_tokens // 262144' "$MODEL_CONF" 2>/dev/null || echo
 MAMBACACHE=$(jq -r '.max_mamba_cache_size // empty' "$MODEL_CONF" 2>/dev/null || echo "")
 MAMBA_FLAGS=()
 [[ -n "$MAMBACACHE" ]] && MAMBA_FLAGS=(--max-mamba-cache-size "$MAMBACACHE")
-# fp8_e4m3 KV requires the QSA fp8 tile-dequant fix (gabrielolympie
-# sglang-flashnext-sm120 patch 0002): the stock QSA sparse-prefill Triton
-# kernel feeds fp8 straight into tl.dot and dies with "Unsupported rhs dtype
-# fp8e4nv". The patched sparse_attn.py is bind-mounted read-only into the
-# container below; the overlay lives in ~/egpu-nvidia-setup/sglang/qsa-fp8-overlay.
+# fp8_e4m3 KV (the default for the Flash-Next family) requires the QSA fp8
+# tile-dequant fix (gabrielolympie sglang-flashnext-sm120 patch 0002): the
+# stock QSA sparse-prefill Triton kernel feeds fp8 straight into tl.dot and
+# dies with "Unsupported rhs dtype fp8e4nv". The patched sparse_attn.py is
+# bind-mounted read-only into the container below (gated to the Flash-Next
+# family above); the overlay lives in ~/egpu-nvidia-setup/sglang/qsa-fp8-overlay.
 #
 # Second overlay, same mechanism: managers/mm_utils.py, from
 # ~/egpu-nvidia-setup/sglang/mm-offload-overlay. Stock code offloads multimodal
@@ -101,21 +196,7 @@ MAMBA_FLAGS=()
 # The overlay keeps a contiguous check, retries synchronously on failure, and
 # degrades to leaving the feature on device rather than dying. Remove the -v
 # line to fall back to the image's own file.
-KVDTYPE=$(jq -r '.kv_cache_dtype // "fp8_e4m3"' "$MODEL_CONF" 2>/dev/null || echo fp8_e4m3)
-# Speculative (NEXTN/MTP) decoding: on unless the preset disables it. The
-# YaRN long-context preset turns it off -- draft acceptance collapses past
-# ~131k (observed on gufo with this model family), and rejected drafts cost
-# 4x verify compute at deep positions, making decode SLOWER than pure AR.
-# NB: '.speculative // true' would be WRONG here -- jq's // treats false as
-# empty and would silently re-enable it.
-SPECULATIVE=$(jq -r 'if .speculative == null then true else .speculative end' "$MODEL_CONF" 2>/dev/null || echo true)
-if [[ "$SPECULATIVE" == "true" ]]; then
-  SPEC_FLAGS=(--speculative-algorithm NEXTN --speculative-num-steps 3
-              --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
-              --speculative-use-rejection-sampling)
-else
-  SPEC_FLAGS=()
-fi
+# (KVDTYPE and SPEC_FLAGS are set per-family above.)
 # YaRN context extension, exactly per the model card's SGLang recipe
 # (https://huggingface.co/Qwen/Qwen3.8-Flash-Next): static yarn via
 # --json-model-override-args, factor tuned to the target window (2.0 for
@@ -214,19 +295,13 @@ trap 'kill "$WATCHDOG_PID" 2>/dev/null' EXIT
 # kwarg; the modern budget is size.longest_edge). A wrong key here can fail the
 # load, so it stays out until checked.
 MM_FLAGS=()
-MM_XPORT_FLAGS=()
 if [[ "${MM_DISABLE:-0}" != "1" ]]; then
   MM_FLAGS+=( --image-processor-backend pil )
   MM_FLAGS+=( --limit-mm-data-per-request '{"image": 1}' )
-  # Feature transport. Unset means "cpu": every image feature round-trips
-  # through host RAM per prefill chunk over the caching pinned allocator. That
-  # async D2H copy is what raised "CUDA error: invalid argument" twice
-  # (2026-10-16 17:43, 2026-10-19 14:18) and killed the scheduler.
-  # "cuda_ipc" keeps features in a bounded device-resident pool
-  # (SGLANG_MM_FEATURE_CACHE_MB, default 1024 MiB) and falls back to CPU when
-  # the pool is full. Documented in server_args.py:2879 / `sglang serve --help`.
-  # MM_TRANSPORT=cpu reverts to the old behaviour without editing this file.
-  MM_XPORT_FLAGS+=( --mm-feature-transport "${MM_TRANSPORT:-cuda_ipc}" )
+else
+  # Full revert of the multimodal hardening (both families).
+  FLASH_FLAGS=()
+  MM_FAMILY_FLAGS=()
 fi
 
 # --- idle CPU ---------------------------------------------------------------
@@ -251,12 +326,12 @@ echo "sglang: serving $TARGET as $SERVED_NAME on :$PORT" >&2
 
 # Foreground so the unit tracks the server, as the GGUF backends do.
 exec docker run --rm --init --name "$CONTAINER" --gpus all \
+  --log-opt max-size=10m --log-opt max-file=3 \
   --shm-size 32g \
   --ulimit memlock=-1 \
   -p "$PORT:$PORT" \
   -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
-  -v "$HOME/egpu-nvidia-setup/sglang/qsa-fp8-overlay/python/sglang/srt/layers/attention/qsa/sparse_attn.py:/sgl-workspace/sglang/python/sglang/srt/layers/attention/qsa/sparse_attn.py:ro" \
-  -v "$HOME/egpu-nvidia-setup/sglang/mm-offload-overlay/python/sglang/srt/managers/mm_utils.py:/sgl-workspace/sglang/python/sglang/srt/managers/mm_utils.py:ro" \
+  "${OVERLAY_FLAGS[@]}" \
   --cap-add SYS_PTRACE \
   --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,pinned_max_round_threshold_mb:128 \
   --env CUDA_ENABLE_USER_TRIGGERED_COREDUMP=1 \
@@ -264,6 +339,7 @@ exec docker run --rm --init --name "$CONTAINER" --gpus all \
   --env SGLANG_MM_FEATURE_CACHE_MB="${MM_POOL_MB:-1024}" \
   --env SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false \
   --env SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1 \
+  "${SPEC_ENV[@]}" \
   "${LONGCTX_ENV[@]}" \
   --ipc=host \
   "$IMAGE" \
@@ -271,31 +347,26 @@ exec docker run --rm --init --name "$CONTAINER" --gpus all \
     --model-path "$TARGET" \
     --served-model-name "$SERVED_NAME" \
     --tp 1 \
-    --quantization modelopt_fp4 \
-    --fp4-gemm-backend flashinfer_cutlass \
-    --moe-runner-backend flashinfer_cutlass \
-    --page-size 64 \
-    --mamba-track-interval 64 \
+    "${TRUST_FLAGS[@]}" \
+    "${QUANT_FLAGS[@]}" \
+    "${FAMILY_FLAGS[@]}" \
+    --page-size "$PAGE_SIZE" \
     --chunked-prefill-size 4096 \
     "${YARN_FLAGS[@]}" \
     --context-length "$CTX" \
     --max-total-tokens "$TOTALTOK" \
     --kv-cache-dtype "$KVDTYPE" \
-    --linear-attn-prefill-backend triton \
-    --linear-attn-decode-backend flashinfer \
     "${SPEC_FLAGS[@]}" \
-    --mamba-radix-cache-strategy extra_buffer \
     --max-running-requests "$MAXRUN" \
     "${MAMBA_FLAGS[@]}" \
     --cuda-graph-max-bs-decode "$CGRAPH" \
-    --mamba-ssm-dtype bfloat16 \
-    --reasoning-parser qwen3 \
-    --tool-call-parser qwen3_coder \
+    "${PARSER_FLAGS[@]}" \
     --mem-fraction-static "$MEMFRAC" \
     "${PLE_FLAGS[@]}" \
     --enable-metrics \
     "${MM_FLAGS[@]}" \
-    "${MM_XPORT_FLAGS[@]}" \
+    "${MM_FAMILY_FLAGS[@]}" \
+    "${FLASH_FLAGS[@]}" \
     "${SLEEP_FLAGS[@]}" \
     --host 0.0.0.0 \
     --port "$PORT"

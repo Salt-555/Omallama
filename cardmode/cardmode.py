@@ -14,10 +14,14 @@ is minutes), so this daemon is the SINGLE owner of them:
     comfy job (or vice versa).
   - After gen_idle_minutes without comfy queue activity it reverts to llm.
   - Policy knobs in ~/.config/llama-server/modes.json (re-read on every
-    switch, edit freely): on contention the LLM wins -- the gate waits up to
-    llm_drain_cap_seconds for the current server to go idle, then answers 503
-    and the client resubmits. The gate FAILS CLOSED: arbiter down = prompts
-    refused, never blindly forwarded. min_dwell_seconds throttles thrash.
+    switch, edit freely): on contention the LLM wins -- the gate WAITS for the
+    current server to go idle (drain), for the card to be handed over, and for
+    the new model to load. NONE of those waits has a deadline (Salt,
+    2026-11-18): the reconciler publishes what it is waiting on as a `phase`
+    state and keeps watching until the condition clears. The gate still FAILS
+    CLOSED on a real conflict or error (arbiter down = prompts refused, an
+    unknown process holding :6969 = abort), but "still busy" is never a
+    refusal. min_dwell_seconds throttles thrash.
     EXCEPTION (2026-10-17): when nothing ACCEPTS connections on :6969 there
     is no work in flight to protect -- in-flight requests imply a live
     listener. A gen-mode demand (comfy prompt) arriving during an llm BOOT
@@ -68,11 +72,22 @@ MODEL_JSON = CFG_DIR / "model.json"
 PRESETS_FILE = CFG_DIR / "presets.json"
 STATE_FILE = CFG_DIR / ".cardmode.json"
 MODELCTL = Path.home() / ".config/omarchy/plugins/salt.llama-server/modelctl.sh"
+# One implementation of runtime semantics (health/counts/ready/label), shared
+# with monitor.sh. cardmode supplies the POLICY -- fail closed -- and this
+# script supplies the SHAPES.
+PROBE = CFG_DIR / "probe.sh"
 SGLANG_CONTAINER = "sglang-llm"  # serve-sglang.sh's --name; ours to reap
+BASALT_CONTAINER = "basalt-llm"  # serve-basalt.sh's --name; same contract
+# serve-basalt.sh's default root (BASALT_ROOT env can move it). Its generated
+# appdata/basalt_config.json names the pack the RUNNING container loaded, which
+# is the only per-shape identity a basalt boot exposes -- the alias is ALLMIND
+# for every pack and the container name is the same for every pack.
+BASALT_ROOT = Path.home() / "egpu-nvidia-setup/basalt"
 
 DEFAULTS = {
     "gen_idle_minutes": 30,
-    "llm_drain_cap_seconds": 600,
+    # Cap on drain/card/load waits: REMOVED 2026-11-18 (Salt). Waiting is a
+    # state now; llm_drain_cap_seconds in modes.json is inert.
     "min_dwell_seconds": 120,
     "sglang_min_free_mib": 90000,
     "gen_min_free_mib": 40000,
@@ -116,9 +131,23 @@ def http(url: str, method: str = "GET", payload=None, timeout: float = 5):
 
 
 def sh(*args: str, timeout: float = 60) -> tuple[int, str]:
-    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    out = (p.stdout + p.stderr).strip()
-    return p.returncode, out
+    """Run a command; NEVER raise.
+
+    A command that outlives its timeout answers rc 124 with "timeout", which
+    every caller already treats as a failed read. That is deliberate: a wait
+    on a slow probe must cost one state update, never an exception. On
+    2026-11-18 a bare nvidia-smi timeout escaped the idle timer's thread and
+    killed it for good (23 hours stuck in gen with every surface healthy).
+    """
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"command timed out after {timeout:.0f}s: {' '.join(args[:2])} (state: unknown)")
+        return 124, "timeout"
+    except Exception as e:  # noqa: BLE001
+        log(f"command failed to run: {' '.join(args[:2])}: {e!r}")
+        return 125, str(e)
+    return p.returncode, (p.stdout + p.stderr).strip()
 
 
 class Engine:
@@ -130,6 +159,11 @@ class Engine:
             "switching": False,
             "enabled": True,
             "note": "boot",
+            # What the reconciler is WAITING on, as a state: "waiting: drain
+            # 2 in flight", "waiting: card handoff (71000/90000 MiB free)",
+            # "loading llm". Empty = nothing pending. A wait has no deadline;
+            # it publishes itself here and keeps watching.
+            "phase": "",
         }
         self.last_revert_try = 0.0
         self._load_persisted()
@@ -156,6 +190,18 @@ class Engine:
         without touching the boot-preserved activity anchor."""
         self.st["note"] = "state re-derived"
         self.save()
+
+    def set_phase(self, text: str) -> None:
+        """Publish what we are waiting on. A wait is a STATE: nothing here has
+        a deadline, and nothing refuses because a condition is not clear yet.
+        Logged only on change, because the drain/handoff loops re-assert it
+        every few seconds."""
+        text = " ".join(str(text).split())
+        if self.st.get("phase") == text:
+            return
+        self.st["phase"] = text
+        self.save()
+        log(f"phase: {text or 'idle'}")
 
     # ---------------- probes ----------------
     def current_mode(self, cfg: dict) -> tuple[str, dict]:
@@ -201,21 +247,16 @@ class Engine:
         backend = (want.get("backend") or "").lower()
         if not backend:  # preset without a declared backend: historic mapping
             backend = "sglang" if mode == "llm" else "llama"
+        slots = want.get("n_parallel")
+        if slots is None:
+            slots = want.get("parallel")  # basalt presets name the same knob parallel
         try:
-            status, body = http(url + "/metrics", timeout=3)
-            if status != 200:
-                return False
-            if backend == "sglang":
-                return "sglang:" in body
-            if "llamacpp:" not in body:
-                return False
-            _, models = http(url + "/v1/models", timeout=3)
-            if "ALLMIND" not in models:
-                return False
-            if want.get("n_parallel") is not None:
-                _, props = http(url + "/props", timeout=3)
-                return json.loads(props).get("total_slots") == int(want["n_parallel"])
-            return True
+            # The shapes live in probe.sh (shared with monitor.sh); the policy
+            # lives here. Any non-"yes" -- failed scrape, half-booted engine,
+            # wrong shape on the port -- is NOT ready.
+            rc, out = sh("bash", str(PROBE), "ready", backend, url,
+                         "" if slots is None else str(int(slots)), timeout=10)
+            return rc == 0 and out.strip() == "yes"
         except Exception:  # noqa: BLE001 - fail closed
             return False
 
@@ -224,32 +265,22 @@ class Engine:
         None when the scrape fails. A failed scrape is UNKNOWN, never idle:
         the 2026-10-16 incident stopped sglang mid-request because the
         exception path here returned 0 ("server down = nothing in flight").
-        Metric names per monitor.sh: sglang:* carry verbose labels (sum all
-        lines); llamacpp:* are plain."""
+        The per-runtime metric shapes live in probe.sh, shared with the
+        widget's poller."""
         backend = (mj.get("backend") or "").lower()
         try:
-            _, body = http(cfg["llm_url"] + "/metrics", timeout=3)
+            rc, out = sh("bash", str(PROBE), "counts", backend, cfg["llm_url"], timeout=6)
         except Exception:  # noqa: BLE001 - unknown, fail closed
             return None
-        total = 0.0
-        for line in body.splitlines():
-            if backend == "sglang":
-                if line.startswith("sglang:num_running_reqs{") or line.startswith(
-                    "sglang:num_queue_reqs{"
-                ):
-                    try:
-                        total += float(line.rsplit(" ", 1)[1])
-                    except (IndexError, ValueError):
-                        pass
-            else:
-                if line.startswith("llamacpp:requests_processing ") or line.startswith(
-                    "llamacpp:requests_deferred "
-                ):
-                    try:
-                        total += float(line.rsplit(" ", 1)[1])
-                    except (IndexError, ValueError):
-                        pass
-        return int(total)
+        if rc != 0 or not out.strip():
+            return None
+        parts = out.split()
+        try:
+            active = float(parts[0])
+            deferred = float(parts[1]) if len(parts) > 1 else 0.0
+            return int(active + deferred)
+        except (ValueError, IndexError):
+            return None
 
     def port_held(self, cfg: dict) -> bool:
         """True when something ACCEPTS connections on the LLM port. A connect
@@ -283,7 +314,14 @@ class Engine:
             log(f"comfy /free failed (continuing): {e}")
 
     def tts_active(self, cfg: dict) -> bool:
-        rc, _ = sh("systemctl", "--user", "is-active", cfg["tts_service"], timeout=10)
+        # A probe failure must never propagate: this runs inside the idle
+        # timer's tick AND inside ensure()'s transition, and an nvidia-smi or
+        # systemctl timeout under load used to kill the timer thread outright.
+        try:
+            rc, _ = sh("systemctl", "--user", "is-active", cfg["tts_service"], timeout=10)
+        except Exception as e:  # noqa: BLE001
+            log(f"tts state probe failed (treating as off): {e!r}")
+            return False
         return rc == 0
 
     def tts_set(self, cfg: dict, on: bool) -> None:
@@ -303,12 +341,16 @@ class Engine:
         lim = float(cfg.get("tts_pressure_min_free_pct", 1.0))
         if lim <= 0 or not self.tts_active(cfg):
             return
-        rc, out = sh(
-            "nvidia-smi",
-            "--query-gpu=memory.used,memory.total",
-            "--format=csv,noheader,nounits",
-            timeout=10,
-        )
+        try:
+            rc, out = sh(
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+                timeout=10,
+            )
+        except Exception as e:  # noqa: BLE001 - pressure valve skips this tick
+            log(f"tts pressure probe failed (skipped): {e!r}")
+            return
         try:
             pairs = [[int(x) for x in l.split(",", 1)] for l in out.splitlines() if l.strip()]
             used, total = max(pairs, key=lambda p: p[0])
@@ -339,6 +381,34 @@ class Engine:
         invisible, and the revert pays one reload."""
         if (self.preset_for_mode(cfg, "llm").get("backend") or "").lower() == "llama":
             return self.ready_for(cfg, "llm")
+        if (self.preset_for_mode(cfg, "llm").get("backend") or "").lower() == "basalt":
+            # The container NAME is shared: the gen preset is a basalt pack too
+            # and runs as the SAME basalt-llm. "running" therefore proves
+            # nothing about WHICH pack holds the card -- and on 2026-11-14,
+            # when llm mode became a basalt preset, that shortcut adopted the
+            # gen 27B as if it were an llm boot on every idle revert (4/4),
+            # flipping model.json to the Chat preset while the card kept the
+            # image pack. No gen -> llm transition ran again for three days
+            # (35 of them in the sixteen days before, all from this branch's
+            # sglang path). Identity has to come from the pack, not the name.
+            #
+            # serve-basalt.sh regenerates appdata/basalt_config.json from
+            # model.json BEFORE it execs docker, so the file records the pack
+            # the running container actually loaded -- and it is available
+            # during the load window, when no HTTP probe can answer yet.
+            try:
+                rc, out = sh("docker", "inspect", "-f", "{{.State.Running}}", BASALT_CONTAINER, timeout=10)
+                if not (rc == 0 and out.strip() == "true"):
+                    return False
+            except Exception:  # noqa: BLE001
+                return False
+            want = self.preset_for_mode(cfg, "llm").get("model") or ""
+            try:
+                booted = json.loads((BASALT_ROOT / "appdata/basalt_config.json").read_text())
+                packs = {Path(m.get("model") or "").name for m in booted.get("models") or []}
+            except Exception:  # noqa: BLE001 - unreadable launch config: no evidence
+                return False
+            return bool(want) and Path(want).name in packs
         try:
             rc, out = sh("docker", "inspect", "-f", "{{.State.Running}}", SGLANG_CONTAINER, timeout=10)
             if rc == 0 and out.strip() == "true":
@@ -351,30 +421,40 @@ class Engine:
         except Exception:  # noqa: BLE001
             return False
 
-    def gpu_free_mib(self):
+    def gpu_free_mib(self) -> tuple["int | None", bool]:
+        """(free MiB, probe_trustworthy). A TIMED-OUT probe is unknown, not
+        'the card is gone': the handoff guard must keep waiting on unknown, or
+        a slow nvidia-smi reads as free and the next model loads into the
+        outgoing one's memory. Only a probe that actually runs and reports no
+        card is allowed to mean 'nothing to wait for'."""
+        rc, out = sh(
+            "nvidia-smi",
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+            timeout=10,
+        )
+        if rc in (124, 125):  # timed out / could not run: state unknown
+            return None, True
         try:
-            rc, out = sh(
-                "nvidia-smi",
-                "--query-gpu=memory.free",
-                "--format=csv,noheader,nounits",
-                timeout=10,
-            )
             vals = [int(l.strip()) for l in out.splitlines() if l.strip()]
-            return max(vals) if rc == 0 and vals else None
-        except Exception:  # noqa: BLE001
-            return None
+        except ValueError:
+            return None, False
+        return (max(vals) if rc == 0 and vals else None), bool(rc == 0 and vals)
 
-    def wait_gpu_free(self, need_mib: int, deadline_s: float) -> bool:
-        t0 = time.time()
-        while time.time() - t0 < deadline_s:
-            free = self.gpu_free_mib()
-            if free is None:  # no nvidia-smi / no card: don't block forever
-                return True
-            if free >= need_mib:
-                return True
-            log(f"card handoff: free {free} MiB < {need_mib} MiB, waiting")
+    def wait_gpu_free(self, need_mib: int) -> None:
+        """Wait for the card. No deadline, no abort: the outgoing server's
+        release lag is measured in seconds, and a transition that waits is
+        better than one that dies after an arbitrary 90 s and leaves the box
+        half-switched."""
+        while True:
+            free, known = self.gpu_free_mib()
+            if not known:  # probe ran and found no card: nothing to wait for
+                return
+            if free is not None and free >= need_mib:
+                return
+            shown = "unknown" if free is None else f"{free} MiB free"
+            self.set_phase(f"waiting: card handoff ({shown}/{need_mib} needed)")
             time.sleep(5)
-        return False
 
     # ---------------- the one transition executor ----------------
     def ensure(self, target: str, reason: str) -> tuple[bool, str]:
@@ -398,7 +478,7 @@ class Engine:
             dwell = float(cfg["min_dwell_seconds"])
             gap = dwell - (time.time() - self.st["last_switch_ts"])
             if cur != target and gap > 0 and not preempting:
-                log(f"dwell: waiting {gap:.0f}s before {cur} -> {target} ({reason})")
+                self.set_phase(f"waiting: dwell {gap:.0f}s before {cur} -> {target} ({reason})")
                 time.sleep(gap)
 
             # LLM wins contention: never restart :6969 with work in flight.
@@ -406,8 +486,11 @@ class Engine:
             # zero reads debounce the stop: the second one is the re-check
             # immediately before systemctl stop, closing the
             # request-arrived-between-polls race.
-            cap = float(cfg["llm_drain_cap_seconds"])
-            t0 = time.time()
+            #
+            # NO DRAIN CAP (Salt, 2026-11-18): waiting for the port to go idle
+            # is a state, not a deadline. The old 600 s cap turned a busy server
+            # into a 503 the client had to retry; the reconciler now publishes
+            # what it is waiting on and keeps watching until the work drains.
             zeros = 0
             while True:
                 busy = self.llm_busy(mj, cfg)
@@ -421,20 +504,17 @@ class Engine:
                         # No listener on :6969: no work to drain. A live
                         # container here is a boot in progress -- cancel it
                         # (comfy demand preempts an llm load, 2026-10-17)
-                        # rather than holding the gate to the cap and killing
-                        # the boot afterward anyway.
+                        # rather than waiting on a boot that will be killed
+                        # afterward anyway.
                         log(f"preempting {cur} -> {target}: no listener on :6969 ({reason})")
                         break
-                    if time.time() - t0 > cap:
-                        why = "unknown (scrape failed)" if busy is None else f"{busy} in flight"
-                        self.st["note"] = f"switch {target} blocked: llm busy > cap ({reason})"
-                        self.save()
-                        return False, f"llm still busy after {cap:.0f}s ({why}) ({reason})"
-                    log(f"draining :6969 ({'unknown' if busy is None else busy} in flight), {reason}")
+                    self.set_phase(
+                        f"waiting: drain ({'unknown in flight' if busy is None else str(busy) + ' in flight'})"
+                        f" before {cur} -> {target} ({reason})"
+                    )
                 time.sleep(5)
 
             preset = modes[target]["preset"]
-            ready_to = int(modes[target].get("ready_timeout", 600 if target == "llm" else 180))
             self.st["switching"] = True
             self.st["note"] = f"switching {cur} -> {target} ({reason})"
             self.save()
@@ -457,26 +537,18 @@ class Engine:
                 tts_on = False
             # Must exceed the unit's TimeoutStopSec (300): returning early
             # would have cardmode act on a stop still in flight -- two owners.
-            sh("systemctl", "--user", "stop", "llama-server.service", timeout=360)
+            # sh() never raises, so a wedged stop lands as rc 124 and the card
+            # handoff below simply waits for the release instead of aborting.
+            self.set_phase(f"stopping {cur} for {target} ({reason})")
+            rc, out = sh("systemctl", "--user", "stop", "llama-server.service", timeout=360)
+            if rc != 0:
+                log(f"stop returned rc {rc}: {out[:160]} (continuing; the card guard is the sync)")
             need = int(cfg["sglang_min_free_mib" if target == "llm" else "gen_min_free_mib"])
-            if not self.wait_gpu_free(need, 90 if target == "llm" else 120):
-                # Fail closed. "launching anyway" fired live 2026-10-16 into an
-                # orphaned container still holding the card -- that IS the OOM
-                # race this reconciler exists to prevent. Refuse instead; the
-                # gate answers 503 and the client resubmits.
-                self.st.update(
-                    switching=False,
-                    note=f"switch to {target} aborted: card not free ({need} MiB target)",
-                )
-                self.save()
-                if tts_on:
-                    self.tts_set(cfg, True)
-                log(f"card not free ({need} MiB target) for {target}; aborting switch")
-                return False, self.st["note"]
+            self.wait_gpu_free(need)
 
             rc, out = sh("bash", str(MODELCTL), "set", preset)
             if rc != 0:
-                self.st.update(switching=False, note=f"modelctl set failed: {out}")
+                self.st.update(switching=False, phase="", note=f"modelctl set failed: {out}")
                 self.save()
                 if tts_on:
                     self.tts_set(cfg, True)
@@ -485,12 +557,15 @@ class Engine:
             # Identity gate before the start: with the unit down, a surviving
             # sglang container is OUR orphan (the 2026-10-16 zombie held ~94 GiB
             # and :6969 while answering every liveness check) -- reap it. An
-            # unknown squatter is not ours: abort, fail closed.
+            # unknown squatter is not ours: a conflict, not a wait, so fail.
             if sh("docker", "rm", "-f", SGLANG_CONTAINER)[0] == 0:
                 log(f"reaped leftover container {SGLANG_CONTAINER}")
+            if sh("docker", "rm", "-f", BASALT_CONTAINER)[0] == 0:
+                log(f"reaped leftover container {BASALT_CONTAINER}")
             if self.port_held(cfg):
                 self.st.update(
                     switching=False,
+                    phase="",
                     note=f"switch to {target} aborted: something still holds :6969",
                 )
                 self.save()
@@ -500,12 +575,15 @@ class Engine:
 
             rc, out = sh("systemctl", "--user", "start", "llama-server.service", timeout=120)
 
+            # Loading is a state too: a 67.8 GiB pack takes as long as it takes.
             t0 = time.time()
-            while time.time() - t0 < ready_to:
+            self.set_phase(f"loading {target} ({reason})")
+            while True:
                 if self.ready_for(cfg, target):
                     now = time.time()
                     self.st.update(
                         switching=False,
+                        phase="",
                         last_switch_ts=now,
                         note=f"in {target} (was {cur}, {reason})",
                     )
@@ -514,19 +592,14 @@ class Engine:
                         # reverts even if nobody ever prompted it
                         self.st["last_gen_activity"] = now
                     self.save()
-                    # Restore TTS last: sglang is confirmed serving, so its
-                    # ~0.98-card malloc has landed and Chatterbox's ~4 GB now
-                    # fits the residual headroom.
+                    # Restore TTS last: the new runtime is confirmed serving, so
+                    # its startup malloc has landed and Chatterbox's ~4 GB fits
+                    # the residual headroom.
                     if tts_on:
                         self.tts_set(cfg, True)
                     log(f"switched {cur} -> {target} in {now - t0:.0f}s ({reason})")
                     return True, self.st["note"]
                 time.sleep(3)
-            self.st.update(switching=False, note=f"switch to {target} timed out ({reason})")
-            self.save()
-            if tts_on:
-                self.tts_set(cfg, True)
-            return False, self.st["note"]
 
     # ---------------- surfaces ----------------
     def handle_gate(self, method: str = "GET") -> tuple[int, str]:
@@ -553,44 +626,61 @@ class Engine:
         return 503, why
 
     def idle_loop(self) -> None:
+        """The idle timer, in a thread that must outlive its probes.
+
+        This daemon thread IS the only thing that ever returns the card from
+        gen to llm on its own. On 2026-11-18 10:22 an nvidia-smi call inside
+        tts_pressure_check hit its 10 s timeout under load, the TimeoutExpired
+        escaped the thread's target, and the thread died for good: the gate
+        kept answering 200 (so nothing looked broken) while no revert could
+        ever fire again. A probe that fails may cost one tick, never the loop.
+        """
         while True:
             time.sleep(15)
-            cfg = load_cfg()
-            cur, _ = self.current_mode(cfg)
-            if self.comfy_busy(cfg):
-                self.st["last_gen_activity"] = time.time()
-                self.save()
-            # Same lock as ensure(): a switch mid-flight owns the card; its
-            # bounce already handles TTS, and a pressure probe racing it would
-            # just read stale numbers.
-            with self.lock:
-                self.tts_pressure_check(cfg)
-            if cur == "gen" and self.st.get("enabled", True):
-                idle_s = float(cfg["gen_idle_minutes"]) * 60
-                if time.time() - self.st["last_gen_activity"] > idle_s:
-                    if time.time() - self.last_revert_try < 60:
-                        continue
-                    self.last_revert_try = time.time()
-                    # Adopt a manual llm boot instead of killing it. The
-                    # mode is derived from model.json alone, so an sglang
-                    # boot that predates cardmode's own switch reads as
-                    # "gen" here and the revert paid the ~3 min load twice
-                    # (2026-10-17). If the unit is up and an sglang runtime
-                    # exists, llm is already arriving -- claim it.
-                    if self.unit_active() and self.llm_runtime_evidence(cfg):
-                        preset = (cfg.get("modes") or {}).get("llm", {}).get("preset")
-                        if preset:
-                            sh("bash", str(MODELCTL), "set", preset, timeout=60)
-                        self.st.update(
-                            switching=False,
-                            last_switch_ts=time.time(),
-                            note="adopted manual llm boot (gen-idle revert skipped)",
-                        )
-                        self.save()
-                        log(self.st["note"])
-                        continue
-                    ok, why = self.ensure("llm", "gen-idle")
-                    log(f"idle revert: {'ok' if ok else 'FAILED'}: {why}")
+            try:
+                self.idle_tick()
+            except Exception as e:  # noqa: BLE001 - a bad tick is not a dead timer
+                log(f"idle tick failed (loop continues): {e!r}")
+
+    def idle_tick(self) -> None:
+        cfg = load_cfg()
+        cur, _ = self.current_mode(cfg)
+        if self.comfy_busy(cfg):
+            self.st["last_gen_activity"] = time.time()
+            self.save()
+        # Same lock as ensure(): a switch mid-flight owns the card; its
+        # bounce already handles TTS, and a pressure probe racing it would
+        # just read stale numbers.
+        with self.lock:
+            self.tts_pressure_check(cfg)
+        if cur == "gen" and self.st.get("enabled", True):
+            idle_s = float(cfg["gen_idle_minutes"]) * 60
+            if time.time() - self.st["last_gen_activity"] > idle_s:
+                if time.time() - self.last_revert_try < 60:
+                    return
+                self.last_revert_try = time.time()
+                # Adopt a manual llm boot instead of killing it. The mode is
+                # derived from model.json alone, so an llm boot that predates
+                # cardmode's own switch reads as "gen" here and the revert paid
+                # the ~3 min load twice (2026-10-17). The evidence call must
+                # prove the RESIDENT SHAPE is the llm preset -- on a basalt
+                # backend the container name and the ALLMIND id are shared by
+                # both modes, and trusting them adopted the gen pack 4/4 from
+                # 2026-11-14, leaving the card on the image pack for days.
+                if self.unit_active() and self.llm_runtime_evidence(cfg):
+                    preset = (cfg.get("modes") or {}).get("llm", {}).get("preset")
+                    if preset:
+                        sh("bash", str(MODELCTL), "set", preset, timeout=60)
+                    self.st.update(
+                        switching=False,
+                        last_switch_ts=time.time(),
+                        note="adopted manual llm boot (gen-idle revert skipped)",
+                    )
+                    self.save()
+                    log(self.st["note"])
+                    return
+                ok, why = self.ensure("llm", "gen-idle")
+                log(f"idle revert: {'ok' if ok else 'FAILED'}: {why}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -648,7 +738,7 @@ class Handler(BaseHTTPRequestHandler):
                 last_gen_activity_iso=time.strftime(
                     "%Y-%m-%dT%H:%M:%S", time.localtime(st.get("last_gen_activity", 0))
                 ),
-                gpu_free_mib=self.engine.gpu_free_mib(),
+                gpu_free_mib=self.engine.gpu_free_mib()[0],
             )
             self._reply(200, json.dumps(st, indent=2) + "\n")
         elif u.path == "/enable":
