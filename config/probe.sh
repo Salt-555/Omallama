@@ -41,9 +41,17 @@ probe_health() {
   local backend="${1,,}" base="${2:-$BASE_DEFAULT}" code body
   case "$backend" in
     sglang)
-      # 200 with an EMPTY body; 503 while a model loads.
+      # 200 with an EMPTY body; 503 while a model loads -- AND while it drains
+      # gracefully (still serving, still holding the card). Callers already
+      # render `loading` distinctly, and monitor's draining state keys off
+      # residency, not this word; conflating both into 'down' hid the two
+      # moments the operator most needs to know the card is still held.
       code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "$base/health" 2>/dev/null || echo 000)
-      [[ "$code" == "200" ]] && printf 'ok' || printf 'down'
+      case "$code" in
+        200) printf 'ok' ;;
+        503) printf 'loading' ;;
+        *)   printf 'down' ;;
+      esac
       ;;
     basalt)
       # Binds its HTTP server BEFORE the pack loads: 200 with
@@ -52,7 +60,7 @@ probe_health() {
       body=$(curl -sf -m 2 "$base/health" 2>/dev/null || true)
       if [[ -z "$body" ]]; then
         printf 'down'
-      elif grep -q '"loaded": *true' <<<"$body"; then
+      elif [[ "$(jq -r '.loaded // false' <<<"$body" 2>/dev/null)" == "true" ]]; then
         printf 'ok'
       else
         printf 'loading'
@@ -104,11 +112,21 @@ probe_ready() {
   case "$backend" in
     sglang)
       body=$(curl -sf -m 3 "$base/metrics" 2>/dev/null) || { printf 'no'; return; }
-      grep -q '^sglang:' <<<"$body" && printf 'yes' || printf 'no'
+      grep -q '^sglang:' <<<"$body" || { printf 'no'; return; }
+      # Identity is the served id, not the metric family. The header rule
+      # ("every branch demands the ALLMIND id") was unenforced in this branch,
+      # so ANY sglang-family responder passed -- the 2026-10-16 zombie class.
+      # Lane-shape comparison deliberately NOT added: sglang has no verified
+      # per-boot slot source yet (.sglang_runtime freshness unresolved).
+      models=$(curl -sf -m 3 "$base/v1/models" 2>/dev/null) || { printf 'no'; return; }
+      grep -q 'ALLMIND' <<<"$models" && printf 'yes' || printf 'no'
       ;;
     basalt)
       body=$(curl -sf -m 3 "$base/health" 2>/dev/null) || { printf 'no'; return; }
-      if ! grep -q '"model": *"ALLMIND"' <<<"$body" || ! grep -q '"loaded": *true' <<<"$body"; then
+      # jq, not spacing-sensitive greps: a JSON reformat (space/key order)
+      # must not flip a healthy basalt to not-ready -- a fail-CLOSED stall
+      # where a mode transition never completes and nothing says why.
+      if [[ "$(jq -r 'if (.model == "ALLMIND" and .loaded == true) then "yes" else "no" end' <<<"$body" 2>/dev/null || echo no)" != "yes" ]]; then
         printf 'no'
         return
       fi

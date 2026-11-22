@@ -200,7 +200,7 @@ case "${1:-}" in
     # when two presets share one path with different specs.
     name=$(jq -r --arg n "$sel" '.[] | select(.name == $n) | .name' "$PRESETS" 2>/dev/null | head -1)
     jq -n --arg m "$resolved" --arg s "$spec" --arg n "$name" --arg b "$backend" \
-      '{model: $m, spec: $s, backend: $b} + (if $n != "" then {name: $n} else {} end)' > "$MODEL"
+      '{model: $m, spec: $s, backend: $b} + (if $n != "" then {name: $n} else {} end)' > "$MODEL.tmp" && mv "$MODEL.tmp" "$MODEL"
     # Preset tuning keys (SGLang: context_length, max_total_tokens,
     # max_running_requests, max_mamba_cache_size, mem_fraction_static,
     # kv_cache_dtype, speculative, rope_parameters; llama.cpp: n_parallel,
@@ -214,9 +214,13 @@ case "${1:-}" in
     # derives. This used to be a whitelist of 19 names, and a knob nobody
     # remembered to add was dropped SILENTLY: the launcher reads model.json,
     # so the only symptom was a flag that never took effect.
-    jq --arg n "$sel" -s '
+    # Key the merge on name OR resolved path: `modelctl.sh set <path>`
+    # matches no preset by name, and a name-only merge silently dropped every
+    # tuning key for path selections -- exactly the flag-never-took-effect
+    # bug this generic merge replaced the old whitelist to kill.
+    jq --arg n "$sel" --arg mpath "$resolved" -s '
       .[0] as $model | .[1] as $presets
-      | ($presets | map(select(.name == $n))[0] // {}) as $p
+      | ($presets | map(select(.name == $n or .model == $mpath))[0] // {}) as $p
       | reduce ($p | keys_unsorted[]) as $k
         ($model;
          if ($k == "name" or $k == "model" or $k == "backend"
