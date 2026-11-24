@@ -661,11 +661,20 @@ Panel {
           value: root.cDefaultLimit
           onModified: root.cDefaultLimit = value
         }
-        Column {
+        // Scrollable when the client list outgrows the panel: capped height,
+        // wheel/drag only when it actually overflows.
+        Flickable {
           width: parent.width
-          spacing: Style.space(4)
-          visible: root.limitRows.length > 0
-          Repeater {
+          height: Math.min(rowsColumn.height, 280)
+          clip: true
+          interactive: contentHeight > height
+          boundsBehavior: Flickable.StopAtBounds
+          contentHeight: rowsColumn.height
+          Column {
+            id: rowsColumn
+            width: parent.width
+            spacing: Style.space(4)
+            Repeater {
             model: root.limitRows
             // Active client = a request in flight right now (through the door
             // or direct past it). The row carries a hover-style fill so a
@@ -739,6 +748,7 @@ Panel {
               }
             }
           }
+        }
         }
         Text {
           width: parent.width
