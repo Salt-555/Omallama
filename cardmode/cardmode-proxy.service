@@ -8,6 +8,11 @@ Wants=cardmode.service
 
 [Service]
 ExecStartPre=/usr/bin/mkdir -p %h/.local/state/cardmode/run %h/.local/state/cardmode/logs
+# Re-derive the LLM door's listen lines from the live interfaces BEFORE nginx
+# binds: a DHCP address change must not brick the proxy on its next start.
+# Best-effort by contract (never fails the unit); no-op while the door is off
+# and when the address set is unchanged.
+ExecStartPre=%h/.config/omarchy/plugins/salt.llama-server/llm-door.sh render
 ExecStart=/usr/sbin/nginx -p %h/.local/state/cardmode -c %h/.config/cardmode/nginx.conf -g "daemon off;"
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always

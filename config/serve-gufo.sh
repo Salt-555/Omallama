@@ -136,7 +136,7 @@ exec docker run --rm --init --name "$CONTAINER" --stop-timeout 15 \
   --device /dev/kfd --device /dev/dri \
   ${GROUP_ARGS[@]+"${GROUP_ARGS[@]}"} \
   --ulimit memlock=-1 \
-  -p "$PORT:$PORT" \
+  -p 127.0.0.1:"$PORT:$PORT" \
   -v "$MODELS_ROOT:/models:ro" \
   -v "$CACHE_DIR:/cache" \
   "$IMAGE" \

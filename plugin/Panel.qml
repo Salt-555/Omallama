@@ -53,6 +53,16 @@ Panel {
   property int cIdle: 30
   property string cLlmPreset: ""
   property string cGenPreset: ""
+  // Per-client lane limits for the LLM proxy door (:8191, fronting :6969).
+  // Rows come from llmlimits.sh list: configured clients plus every IP seen
+  // on the door, with hit counts. Save applies them through llmlimits.sh,
+  // which regenerates the nginx limit map and gracefully reloads the proxy
+  // (in-flight requests finish; no model touched). 0 = unlimited.
+  property var limitRows: []
+  property int cDefaultLimit: 0
+  // State of the :6969 door (llm-door.sh): on = external :6969 passes the
+  // limits, off = external clients bypass them until it is enabled.
+  property string doorState: "off"
 
   function intOf(v, d) { var n = Number(v); return (v === null || v === undefined || isNaN(n)) ? d : n }
   function presetOf(mode, d) {
@@ -66,7 +76,17 @@ Panel {
   }
   function openConfig() {
     root.loadConfig()
+    root.loadLimits()
     root.configOpen = true
+  }
+  function loadLimits() {
+    if (!limitsListProc.running) limitsListProc.running = true
+  }
+  function toggleDoor() {
+    if (doorProc.running) return
+    configNote = ""
+    doorProc.command = ["bash", s.pluginDir + "/llm-door.sh", doorState === "on" ? "disable" : "enable"]
+    doorProc.running = true
   }
   function closeConfig() {
     configPresetLlm.close()
@@ -88,6 +108,17 @@ Panel {
     configNote = ""
     configSaveProc.command = ["bash", s.pluginDir + "/modesctl.sh", "save", JSON.stringify(patch)]
     configSaveProc.running = true
+    // Limits ride the same Save button: only nonzero rows are written, so an
+    // untouched list never changes a limit.
+    var limitPatch = {
+      default: cDefaultLimit,
+      clients: limitRows.reduce(function(acc, r) {
+        if (r.limit > 0) acc[r.ip] = r.limit
+        return acc
+      }, {})
+    }
+    limitsSaveProc.command = ["bash", s.pluginDir + "/llmlimits.sh", "apply", JSON.stringify(limitPatch)]
+    limitsSaveProc.running = true
     // Deliberately NOT closing: the save result ("saved" / the error) is
     // rendered inside the config view, which is invisible once closed. The
     // old close-on-save made both outcomes silent.
@@ -580,6 +611,112 @@ Panel {
           onChanged: root.cGenPreset = value
         }
 
+        // ---- per-client lane limits (LLM door) ------------------------------
+        // One row per client seen on the doors (or pinned by hand), each with
+        // a lane cap. 0 = unlimited. Applied on Save: llmlimits.sh
+        // regenerates the nginx limit map and gracefully reloads the proxy.
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+          Text {
+            width: parent.width - doorBtn.width - parent.spacing
+            anchors.verticalCenter: parent.verticalCenter
+            elide: Text.ElideRight
+            text: "Client lane limits · LLM"
+            color: root.barForeground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+          Button {
+            id: doorBtn
+            text: root.doorState === "on" ? "Door: on" : "Door: off"
+            leftAlign: true
+            selected: root.doorState === "on"
+            foreground: root.barForeground
+            opacity: enabled ? 1.0 : 0.35
+            onClicked: root.toggleDoor()
+          }
+        }
+        Text {
+          width: parent.width
+          visible: root.doorState !== "on"
+          wrapMode: Text.WordWrap
+          text: "Door off — external clients reach the server past the limits. Enable flips the :6969 door on (refuses while a backend is still published wide; restart it first)."
+          color: root.barForeground
+          opacity: 0.45
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+        NumberField {
+          width: parent.width
+          label: "Default lanes for new clients (0 = unlimited)"
+          from: 0
+          to: 8
+          value: root.cDefaultLimit
+          onModified: root.cDefaultLimit = value
+        }
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+          visible: root.limitRows.length > 0
+          Repeater {
+            model: root.limitRows
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+              Text {
+                width: parent.width - limitField.width - parent.spacing
+                elide: Text.ElideMiddle
+                anchors.verticalCenter: parent.verticalCenter
+                // Row height follows the spinbox; the text rides its middle.
+                // "direct" = connected to :6969 past the door (limit applies
+                // only once the client points at :8191); "live" = a request
+                // in flight through :8191 right now.
+                text: modelData.ip
+                      + (modelData.hits > 0 ? "  ·  " + modelData.hits + " req" : "")
+                      + (modelData.direct > 0 ? "  ·  direct" + (modelData.direct > 1 ? " ×" + modelData.direct : "") : "")
+                      + (modelData.live > 0 ? "  ·  live" + (modelData.live > 1 ? " ×" + modelData.live : "") : "")
+                color: root.barForeground
+                opacity: 0.7
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              NumberField {
+                id: limitField
+                from: 0
+                to: 8
+                stepSize: 1
+                value: modelData.limit
+                // Edits land on the row object; Save reads them. No binding
+                // notification needed — the list reloads after save anyway.
+                onModified: root.limitRows[index].limit = value
+              }
+            }
+          }
+        }
+        Text {
+          width: parent.width
+          visible: root.limitRows.some
+                   && root.limitRows.some(function(r) { return (r.direct || 0) > 0 })
+          wrapMode: Text.WordWrap
+          text: "direct = connected past the door — limits apply once the :6969 door is on."
+          color: root.barForeground
+          opacity: 0.45
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+        Text {
+          width: parent.width
+          visible: root.limitRows.length === 0
+          wrapMode: Text.WordWrap
+          text: "No clients yet — IPs appear here once a client connects to the LLM."
+          color: root.barForeground
+          opacity: 0.45
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+
         // ---- save feedback ------------------------------------------------
         Text {
           width: parent.width
@@ -650,6 +787,55 @@ Panel {
     repeat: true
     running: root.visible
     onTriggered: root.loadHistory()
+  }
+
+  Process {
+    id: doorProc
+    stderr: StdioCollector { id: doorErr; waitForEnd: true }
+    stdout: StdioCollector { id: doorOut; waitForEnd: true }
+    onExited: function(code) {
+      var err = String((doorErr.text || "")).trim()
+      var out = String((doorOut.text || "")).trim()
+      // enable can legitimately refuse (port still held by a wide-published
+      // backend) — its stderr is the instruction, so it wins the note.
+      root.configNote = code !== 0 ? (err !== "" ? err : "door toggle failed (exit " + code + ")")
+                                   : (out !== "" ? out : "door updated")
+      root.loadLimits()
+    }
+  }
+
+  Process {
+    id: limitsListProc
+    command: ["bash", s.pluginDir + "/llmlimits.sh", "list"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var o = JSON.parse(String(text || "{}"))
+          root.limitRows = o.rows || []
+          root.cDefaultLimit = root.intOf(o.default, 0)
+          root.doorState = o.door === "on" ? "on" : "off"
+        } catch (e) {
+          root.configNote = "could not read client limits"
+        }
+      }
+    }
+  }
+
+  Process {
+    id: limitsSaveProc
+    stderr: StdioCollector { id: limitsSaveErr; waitForEnd: true }
+    stdout: StdioCollector { id: limitsSaveOut; waitForEnd: true }
+    onExited: function(code) {
+      var err = String((limitsSaveErr.text || "")).trim()
+      // A real failure must win the note over the plain "saved" the cardmode
+      // save may have written; stderr on success (e.g. "proxy down, limits
+      // take effect on start") is still worth showing.
+      if (code !== 0 || err !== "") {
+        root.configNote = code !== 0 ? (err !== "" ? err : "limits save failed (exit " + code + ")") : err
+      }
+      root.loadLimits()
+    }
   }
 
   Process {

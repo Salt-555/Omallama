@@ -147,7 +147,7 @@ exec docker run --rm --init --name "$CONTAINER" \
   --gpus all \
   --ulimit memlock=-1 \
   --log-opt max-size=10m --log-opt max-file=3 \
-  -p "$PORT:$PORT" \
+  -p 127.0.0.1:"$PORT:$PORT" \
   -v "$MODELS_DIR:/models:ro" \
   -v "$APPDATA:/data" \
   "$IMAGE"

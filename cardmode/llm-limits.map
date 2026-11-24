@@ -1,0 +1,42 @@
+# generated shape: llmlimits.sh regenerates this from llm-limits.json —
+# with no entries every client is unlimited. Do not hand-edit.
+map $remote_addr $llm_k1 {
+    127.0.0.1 "";
+    ::1       "";
+    default "";
+}
+map $remote_addr $llm_k2 {
+    127.0.0.1 "";
+    ::1       "";
+    default "";
+}
+map $remote_addr $llm_k3 {
+    127.0.0.1 "";
+    ::1       "";
+    default "";
+}
+map $remote_addr $llm_k4 {
+    127.0.0.1 "";
+    ::1       "";
+    default "";
+}
+map $remote_addr $llm_k5 {
+    127.0.0.1 "";
+    ::1       "";
+    default "";
+}
+map $remote_addr $llm_k6 {
+    127.0.0.1 "";
+    ::1       "";
+    default "";
+}
+map $remote_addr $llm_k7 {
+    127.0.0.1 "";
+    ::1       "";
+    default "";
+}
+map $remote_addr $llm_k8 {
+    127.0.0.1 "";
+    ::1       "";
+    default "";
+}

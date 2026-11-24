@@ -335,7 +335,7 @@ exec docker run --rm --init --name "$CONTAINER" --gpus all \
   --log-opt max-size=10m --log-opt max-file=3 \
   --shm-size 32g \
   --ulimit memlock=-1 \
-  -p "$PORT:$PORT" \
+  -p 127.0.0.1:"$PORT:$PORT" \
   -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
   "${OVERLAY_FLAGS[@]}" \
   --cap-add SYS_PTRACE \
