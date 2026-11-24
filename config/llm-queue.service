@@ -1,0 +1,11 @@
+[Unit]
+Description=Per-client queueing gateway for the LLM door (:6962 -> :6969)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.config/llama-server/llm-queue.py
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target
