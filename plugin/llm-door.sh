@@ -114,7 +114,7 @@ write_door() {
     echo "        return 429 \"rate limited: all lanes busy — retrying is safe\\n\";"
     echo "    }"
     echo "    location @llm_unavailable {"
-    echo "        add_header Retry-After 15 always;"
+    echo "        add_header Retry-After 60 always;"
     echo "        default_type text/plain;"
     echo "        return 503 \"model reloading — the turn will resume on retry\\n\";"
     echo "    }"

@@ -116,7 +116,10 @@ Panel {
     var limitPatch = {
       default: cDefaultLimit,
       clients: limitRows.reduce(function(acc, r) {
-        if (r.limit > 0) acc[r.ip] = r.limit
+        // Explicit 0 = unlimited for this client (survives a nonzero
+        // default); dropping the entry would silently push it into the
+        // default tier instead.
+        acc[r.ip] = r.limit
         return acc
       }, {}),
       names: limitRows.reduce(function(acc, r) {
