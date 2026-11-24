@@ -147,7 +147,8 @@ case "${1:-}" in
          + $seen + $dir + $liv)
       | group_by(.ip) | map(reduce .[] as $x ({}; . * $x))
       | map(. + {hits: (.hits // 0), last: (.last // ""), direct: (.direct // 0), live: (.live // 0),
-                 limit: ($state.clients[.ip] // 0)})
+                 limit: ($state.clients[.ip] // 0),
+                 name: ((($state.names // {})[.ip] // "") | tostring)})
       | sort_by(-(.hits), -(.direct), -(.live), .ip)
       | { default: ($state.default // 0), door: $door, rows: . }'
     ;;
@@ -163,7 +164,11 @@ case "${1:-}" in
       | [.clients // {} | to_entries[] |
          if (.key == "127.0.0.1" or .key == "::1") then "loopback is always unlimited"
          elif (.value | type) != "number" or .value != (.value | floor) or .value < 0 or .value > 8 then "\(.key): limit must be an integer 0..8"
-         else "" end] | map(select(length > 0))
+         else "" end]
+         + [.names // {} | to_entries[] |
+            if (.value | type) != "string" or (.value | test("^[A-Za-z0-9 _-]{1,24}$") | not) then "\(.key): name must be 1-24 chars of letters, digits, space, _ or -"
+            else "" end]
+      | map(select(length > 0))
       | if $d != "" then [$d] + . else . end
       | .[0] // empty')
     if [[ -n "$bad" ]]; then echo "$bad" >&2; exit 1; fi
@@ -171,7 +176,7 @@ case "${1:-}" in
     bak="$STATE.bak.$(date +%Y%m%d%H%M%S)"
     cp -a "$STATE" "$bak"
     tmp="$STATE.tmp.$$"
-    jq '{default: (.default // 0), clients: (.clients // {})}' <(echo "$blob") > "$tmp"
+    jq '{default: (.default // 0), clients: (.clients // {}), names: ((.names // {}) | with_entries(.value |= (tostring | gsub("^ +| +$"; "")))) | with_entries(select(.value != ""))}' <(echo "$blob") > "$tmp"
     mv "$tmp" "$STATE"
 
     cp -a "$MAP" "$MAP.prev" 2>/dev/null || true

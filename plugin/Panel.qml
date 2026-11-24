@@ -115,6 +115,11 @@ Panel {
       clients: limitRows.reduce(function(acc, r) {
         if (r.limit > 0) acc[r.ip] = r.limit
         return acc
+      }, {}),
+      names: limitRows.reduce(function(acc, r) {
+        var n = String(r.name || "").trim()
+        if (n !== "") acc[r.ip] = n
+        return acc
       }, {})
     }
     limitsSaveProc.command = ["bash", s.pluginDir + "/llmlimits.sh", "apply", JSON.stringify(limitPatch)]
@@ -665,15 +670,27 @@ Panel {
             Row {
               width: parent.width
               spacing: Style.space(6)
+              TextField {
+                id: nameField
+                // Device name, optional. Focus-loss or Enter commits it to the
+                // row; Save writes it (backend validates 1-24 safe chars).
+                width: Style.space(108)
+                verticalPadding: Style.space(2)
+                font.pixelSize: Style.font.bodySmall
+                text: modelData.name || ""
+                placeholderText: "name"
+                maximumLength: 24
+                validator: RegularExpressionValidator { regularExpression: /[A-Za-z0-9 _-]{0,24}/ }
+                onEditingFinished: root.limitRows[index].name = text
+              }
               Text {
-                width: parent.width - limitField.width - parent.spacing
+                width: parent.width - nameField.width - limitField.width - parent.spacing * 2
                 elide: Text.ElideMiddle
                 anchors.verticalCenter: parent.verticalCenter
-                // Row height follows the spinbox; the text rides its middle.
-                // "direct" = connected to :6969 past the door (limit applies
-                // only once the client points at :8191); "live" = a request
-                // in flight through :8191 right now.
-                text: modelData.ip
+                // "direct" = connected past the door (limit applies only once
+                // the door is on); "live" = a request in flight right now.
+                text: (modelData.name ? modelData.name + " · " : "")
+                      + modelData.ip
                       + (modelData.hits > 0 ? "  ·  " + modelData.hits + " req" : "")
                       + (modelData.direct > 0 ? "  ·  direct" + (modelData.direct > 1 ? " ×" + modelData.direct : "") : "")
                       + (modelData.live > 0 ? "  ·  live" + (modelData.live > 1 ? " ×" + modelData.live : "") : "")
