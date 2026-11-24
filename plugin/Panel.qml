@@ -674,8 +674,11 @@ Panel {
               width: parent.width
               height: rowBody.height + Style.space(8)
               radius: Math.min(4, Style.cornerRadius)
+              // Active = a request in flight right now (through the door or
+              // direct past it): accent-tinted fill + a leading dot, readable
+              // at a glance from across the room.
               color: (modelData.live > 0 || modelData.direct > 0)
-                     ? Style.controlFill(false, true, root.barForeground, Color.accent)
+                     ? Style.hoverFillFor(root.barForeground, Color.accent)
                      : "transparent"
               Column {
                 id: rowBody
@@ -720,12 +723,16 @@ Panel {
                 Text {
                   width: parent.width
                   elide: Text.ElideMiddle
-                  text: modelData.ip
+                  textFormat: Text.StyledText
+                  text: (modelData.live > 0 || modelData.direct > 0
+                         ? "<font color=\"" + Color.accent + "\">●</font>  "
+                         : "")
+                        + modelData.ip
                         + (modelData.hits > 0 ? "  ·  " + modelData.hits + " req" : "")
                         + (modelData.direct > 0 ? "  ·  direct" + (modelData.direct > 1 ? " ×" + modelData.direct : "") : "")
                         + (modelData.live > 0 ? "  ·  live" + (modelData.live > 1 ? " ×" + modelData.live : "") : "")
                   color: root.barForeground
-                  opacity: (modelData.live > 0 || modelData.direct > 0) ? 0.95 : 0.6
+                  opacity: (modelData.live > 0 || modelData.direct > 0) ? 1.0 : 0.6
                   font.family: Style.font.family
                   font.pixelSize: Style.font.bodySmall
                 }
