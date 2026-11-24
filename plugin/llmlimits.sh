@@ -80,12 +80,37 @@ reload_nginx() {
 }
 
 seen_ips() {
-  # Recently seen client IPs from the :8191 access log (combined format, $1 is
+  # Recently seen client IPs from the door access log (combined format, $1 is
   # the remote address), with per-IP hit counts. Loopback is excluded.
   [[ -f "$ACCESS_LOG" ]] || return 0
   tail -n 20000 "$ACCESS_LOG" \
     | awk '$1 !~ /^(127\.0\.0\.1|::1)$/ { n[$1]++; last[$1]=$4 } END { for (ip in n) print ip, n[ip], last[ip] }' \
     | sort -k2,2 -rn
+}
+
+resolve_names() {
+  # Auto-fill display names for unnamed clients, three sources in order:
+  # 1. `tailscale status` — authoritative for tailnet peers (covers remote
+  #    clients in one call)
+  # 2. mDNS via avahi-resolve — how LAN devices advertise themselves
+  #    (DoomSlayer.local, Katherines-iMac.local)
+  # 3. reverse DNS via getent hosts — MagicDNS already answered here for
+  #    tailscale IPs, and some routers publish DHCP PTRs
+  # Prints "ip name" lines; suffixes (.local, *.ts.net) are stripped. Used as
+  # a SUGGESTION: an operator-set name always wins, and Save persists
+  # whatever the row shows.
+  local ts ip n
+  ts=$(tailscale status 2>/dev/null | awk 'NF >= 2 && $1 ~ /^[0-9a-fA-F.:]+$/ {print $1, $2}')
+  for ip in "$@"; do
+    n=$(awk -v ip="$ip" '$1 == ip {print $2; exit}' <<<"$ts")
+    if [[ -z "$n" ]]; then
+      n=$(timeout 2 avahi-resolve -a "$ip" 2>/dev/null | awk 'NR == 1 {print $2}')
+    fi
+    if [[ -z "$n" ]]; then
+      n=$(getent hosts "$ip" 2>/dev/null | awk 'NR == 1 {print $2}')
+    fi
+    [[ -n "$n" ]] && printf '%s %s\n' "$ip" "$(sed 's/\..*$//' <<<"$n")"
+  done
 }
 
 door_conns() {
@@ -138,7 +163,7 @@ case "${1:-}" in
     grep -qE '^[[:space:]]*listen ' "$HOME/.config/cardmode/llm-door-6969.conf" 2>/dev/null && door=on
     # rows = configured ∪ seen ∪ live-direct ∪ live-through-door, merged by
     # IP (later sources only add their own fields; zeros filled after).
-    jq -n --slurpfile state "$STATE" --arg hits "$hits" --arg direct "$direct" --arg live "$live" --arg door "$door" '
+    DOC=$(jq -n --slurpfile state "$STATE" --arg hits "$hits" --arg direct "$direct" --arg live "$live" --arg door "$door" '
       ($state[0]) as $state
       | ($hits | split("\n") | map(select(length > 0)) | map(split(" ")) | map({ip: .[0], hits: (.[1] | tonumber), last: .[2]})) as $seen
       | ($direct | split("\n") | map(select(length > 0)) | map(split(" ")) | map({ip: .[0], direct: (.[1] | tonumber)})) as $dir
@@ -150,7 +175,15 @@ case "${1:-}" in
                  limit: ($state.clients[.ip] // 0),
                  name: ((($state.names // {})[.ip] // "") | tostring)})
       | sort_by(-(.hits), -(.direct), -(.live), .ip)
-      | { default: ($state.default // 0), door: $door, rows: . }'
+      | { default: ($state.default // 0), door: $door, rows: . }')
+    # Auto-fill names the operator has not set: resolved hostname as a
+    # suggestion, operator-set names always win.
+    unnamed=$(jq -r '.rows[] | select(.name == "") | .ip' <<<"$DOC")
+    if [[ -n "$unnamed" ]]; then
+      auto=$(resolve_names $unnamed | jq -Rn 'reduce inputs as $l ({}; ($l | split(" ")) as $f | if ($f | length) == 2 then . + {($f[0]): $f[1]} else . end)')
+      DOC=$(jq --argjson auto "$auto" '.rows |= map(if .name == "" then .name = ($auto[.ip] // "") else . end)' <<<"$DOC")
+    fi
+    echo "$DOC"
     ;;
   apply)
     ensure_state
