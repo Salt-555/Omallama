@@ -63,6 +63,9 @@ Panel {
   // State of the :6969 door (llm-door.sh): on = external :6969 passes the
   // limits, off = external clients bypass them until it is enabled.
   property string doorState: "off"
+  // True while the operator has moved the default-lanes stepper but not saved;
+  // keeps the resample from resetting the field mid-edit.
+  property bool cDefaultEdited: false
 
   function intOf(v, d) { var n = Number(v); return (v === null || v === undefined || isNaN(n)) ? d : n }
   function presetOf(mode, d) {
@@ -659,7 +662,10 @@ Panel {
           from: 0
           to: 8
           value: root.cDefaultLimit
-          onModified: root.cDefaultLimit = value
+          onModified: {
+            root.cDefaultEdited = true
+            root.cDefaultLimit = value
+          }
         }
         // Scrollable when the client list outgrows the panel: capped height,
         // wheel/drag only when it actually overflows.
@@ -709,7 +715,10 @@ Panel {
                     placeholderText: "name"
                     maximumLength: 24
                     validator: RegularExpressionValidator { regularExpression: /[A-Za-z0-9 _-]{0,24}/ }
-                    onEditingFinished: root.limitRows[index].name = text
+                    onEditingFinished: {
+                      root.limitRows[index].name = text
+                      root.limitRows[index].edited = true
+                    }
                   }
                   Item {
                     width: Math.max(0, parent.width - nameField.width
@@ -724,7 +733,10 @@ Panel {
                     value: modelData.limit
                     // Edits land on the row object; Save reads them. No binding
                     // notification needed — the list reloads after save anyway.
-                    onModified: root.limitRows[index].limit = value
+                    onModified: {
+                      root.limitRows[index].limit = value
+                      root.limitRows[index].edited = true
+                    }
                   }
                 }
                 // Data line gets the FULL row width: ip + activity. The old
@@ -872,9 +884,18 @@ Panel {
       onStreamFinished: {
         try {
           var o = JSON.parse(String(text || "{}"))
-          root.limitRows = o.rows || []
-          root.cDefaultLimit = root.intOf(o.default, 0)
           root.doorState = o.door === "on" ? "on" : "off"
+          // Merge, don't clobber: a row the operator edited but hasn't saved
+          // keeps its values across resamples — the 5s refresh would
+          // otherwise silently reset an in-progress edit to the saved state.
+          var edited = {}
+          root.limitRows.forEach(function(r) { if (r.edited) edited[r.ip] = r })
+          root.limitRows = (o.rows || []).map(function(r) {
+            var e = edited[r.ip]
+            if (e) { r.limit = e.limit; r.name = e.name; r.edited = true }
+            return r
+          })
+          if (!root.cDefaultEdited) root.cDefaultLimit = root.intOf(o.default, 0)
         } catch (e) {
           root.configNote = "could not read client limits"
         }
@@ -893,6 +914,11 @@ Panel {
       // take effect on start") is still worth showing.
       if (code !== 0 || err !== "") {
         root.configNote = code !== 0 ? (err !== "" ? err : "limits save failed (exit " + code + ")") : err
+      } else {
+        // State now matches what was on screen: drop the edit guards so the
+        // reload reflects reality (and later out-of-band changes show up).
+        root.cDefaultEdited = false
+        root.limitRows.forEach(function(r) { r.edited = false })
       }
       root.loadLimits()
     }
