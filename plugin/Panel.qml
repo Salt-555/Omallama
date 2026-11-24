@@ -667,47 +667,68 @@ Panel {
           visible: root.limitRows.length > 0
           Repeater {
             model: root.limitRows
-            Row {
+            // Active client = a request in flight right now (through the door
+            // or direct past it). The row carries a hover-style fill so a
+            // busy client reads at a glance.
+            Rectangle {
               width: parent.width
-              spacing: Style.space(6)
-              TextField {
-                id: nameField
-                // Device name, optional. Focus-loss or Enter commits it to the
-                // row; Save writes it (backend validates 1-24 safe chars).
-                width: Style.space(108)
-                verticalPadding: Style.space(2)
-                font.pixelSize: Style.font.bodySmall
-                text: modelData.name || ""
-                placeholderText: "name"
-                maximumLength: 24
-                validator: RegularExpressionValidator { regularExpression: /[A-Za-z0-9 _-]{0,24}/ }
-                onEditingFinished: root.limitRows[index].name = text
-              }
-              Text {
-                width: parent.width - nameField.width - limitField.width - parent.spacing * 2
-                elide: Text.ElideMiddle
+              height: rowBody.height + Style.space(8)
+              radius: Math.min(4, Style.cornerRadius)
+              color: (modelData.live > 0 || modelData.direct > 0)
+                     ? Style.controlFill(false, true, root.barForeground, Color.accent)
+                     : "transparent"
+              Column {
+                id: rowBody
+                x: Style.space(6)
+                width: parent.width - Style.space(12)
                 anchors.verticalCenter: parent.verticalCenter
-                // "direct" = connected past the door (limit applies only once
-                // the door is on); "live" = a request in flight right now.
-                text: (modelData.name ? modelData.name + " · " : "")
-                      + modelData.ip
-                      + (modelData.hits > 0 ? "  ·  " + modelData.hits + " req" : "")
-                      + (modelData.direct > 0 ? "  ·  direct" + (modelData.direct > 1 ? " ×" + modelData.direct : "") : "")
-                      + (modelData.live > 0 ? "  ·  live" + (modelData.live > 1 ? " ×" + modelData.live : "") : "")
-                color: root.barForeground
-                opacity: 0.7
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-              NumberField {
-                id: limitField
-                from: 0
-                to: 8
-                stepSize: 1
-                value: modelData.limit
-                // Edits land on the row object; Save reads them. No binding
-                // notification needed — the list reloads after save anyway.
-                onModified: root.limitRows[index].limit = value
+                spacing: Style.space(2)
+                Row {
+                  width: parent.width
+                  spacing: Style.space(6)
+                  TextField {
+                    id: nameField
+                    // Device name, optional. Focus-loss or Enter commits it to
+                    // the row; Save writes it (backend validates 1-24 chars).
+                    width: Style.space(130)
+                    verticalPadding: Style.space(2)
+                    font.pixelSize: Style.font.bodySmall
+                    text: modelData.name || ""
+                    placeholderText: "name"
+                    maximumLength: 24
+                    validator: RegularExpressionValidator { regularExpression: /[A-Za-z0-9 _-]{0,24}/ }
+                    onEditingFinished: root.limitRows[index].name = text
+                  }
+                  Item {
+                    width: Math.max(0, parent.width - nameField.width
+                                          - limitField.width - parent.spacing * 2)
+                    height: 1
+                  }
+                  NumberField {
+                    id: limitField
+                    from: 0
+                    to: 8
+                    stepSize: 1
+                    value: modelData.limit
+                    // Edits land on the row object; Save reads them. No binding
+                    // notification needed — the list reloads after save anyway.
+                    onModified: root.limitRows[index].limit = value
+                  }
+                }
+                // Data line gets the FULL row width: ip + activity. The old
+                // single-line row elided this to a few characters.
+                Text {
+                  width: parent.width
+                  elide: Text.ElideMiddle
+                  text: modelData.ip
+                        + (modelData.hits > 0 ? "  ·  " + modelData.hits + " req" : "")
+                        + (modelData.direct > 0 ? "  ·  direct" + (modelData.direct > 1 ? " ×" + modelData.direct : "") : "")
+                        + (modelData.live > 0 ? "  ·  live" + (modelData.live > 1 ? " ×" + modelData.live : "") : "")
+                  color: root.barForeground
+                  opacity: (modelData.live > 0 || modelData.direct > 0) ? 0.95 : 0.6
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
               }
             }
           }
@@ -803,7 +824,12 @@ Panel {
     interval: 5000
     repeat: true
     running: root.visible
-    onTriggered: root.loadHistory()
+    onTriggered: {
+      root.loadHistory()
+      // Limits rows too while the config view is open: the live/direct
+      // highlight is only honest if the rows re-sample while you watch.
+      if (root.configOpen) root.loadLimits()
+    }
   }
 
   Process {
