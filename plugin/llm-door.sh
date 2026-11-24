@@ -79,6 +79,14 @@ write_door() {
     echo "    access_log logs/llm-access.log;"
     echo "    # Prompts and base64 images are multi-MB; nginx's 1 MB default 413s them."
     echo "    client_max_body_size 0;"
+    echo "    # Status reads are not lanes: dashboards poll these while a turn holds"
+    echo "    # the client's only lane, and limiting them just 429s monitoring noise."
+    for p in "= /health" "= /v1/models" "= /models" "= /metrics" "= /props" "= /v1/props"; do
+      echo "    location $p {"
+      echo "        proxy_pass http://127.0.0.1:6969;"
+      echo "        proxy_http_version 1.1;"
+      echo "    }"
+    done
     echo "    location / {"
     for n in 1 2 3 4 5 6 7 8; do
       echo "        limit_conn llm$n $n;"
