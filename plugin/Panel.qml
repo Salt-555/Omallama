@@ -690,10 +690,10 @@ Panel {
               height: rowBody.height + Style.space(8)
               radius: Math.min(4, Style.cornerRadius)
               // Active = a request in flight right now (through the door or
-              // direct past it): accent-tinted fill + a leading dot, readable
-              // at a glance from across the room.
+              // direct past it): selected-strength fill (hover is only 8%
+              // alpha — invisible) + a leading dot, readable at a glance.
               color: (modelData.live > 0 || modelData.direct > 0)
-                     ? Style.hoverFillFor(root.barForeground, Color.accent)
+                     ? Style.selectedFillFor(root.barForeground, Color.accent)
                      : "transparent"
               Column {
                 id: rowBody
@@ -848,9 +848,10 @@ Panel {
   }
 
   // Refresh while the panel is open, so a run finishing behind it appears
-  // without closing and reopening.
+  // without closing and reopening. 2s: the client rows' live highlight is
+  // only honest if it tracks requests as they start and end.
   Timer {
-    interval: 5000
+    interval: 2000
     repeat: true
     running: root.visible
     onTriggered: {
